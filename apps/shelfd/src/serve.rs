@@ -18,7 +18,7 @@ use shelf_keystore::DeviceSigner;
 #[cfg(any(unix, windows))]
 use shelf_store::StoreError;
 #[cfg(any(unix, windows))]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(any(unix, windows))]
 use tokio::sync::Notify;
 
@@ -107,10 +107,11 @@ async fn handle_connection(
     notify: Arc<Notify>,
 ) -> Result<(), DaemonError> {
     let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 || line.trim().is_empty() || line.len() > shelf_core::MAX_FRAME_BYTES {
+    let mut reader = reader;
+    let Some(line) = read_bounded_utf8(&mut reader).await? else {
+        return Ok(());
+    };
+    if line.trim().is_empty() {
         return Ok(());
     }
 
@@ -119,6 +120,7 @@ async fn handle_connection(
             let mutated = matches!(
                 req,
                 IpcRequest::Put { .. }
+                    | IpcRequest::PutFile { .. }
                     | IpcRequest::Pin { .. }
                     | IpcRequest::Rm { .. }
                     | IpcRequest::ScratchAppend { .. }
@@ -152,6 +154,42 @@ fn io_from_json(err: serde_json::Error) -> std::io::Error {
 }
 
 #[cfg(any(unix, windows))]
+async fn read_bounded_utf8<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<String>, DaemonError> {
+    let mut acc = shelf_core::BoundedLine::new();
+    let mut any = false;
+    loop {
+        let mut byte = [0u8; 1];
+        let n = reader.read(&mut byte).await?;
+        if n == 0 {
+            return if any {
+                Err(
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated IPC frame")
+                        .into(),
+                )
+            } else {
+                Ok(None)
+            };
+        }
+        any = true;
+        match acc.push(byte[0]) {
+            Ok(Some(buf)) => {
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "IPC frame exceeds MAX_FRAME_BYTES",
+                )
+                .into());
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn dispatch(req: IpcRequest, store: &mut MemoryStore) -> IpcResponse {
     match req {
         IpcRequest::Put { bytes, kind, name } => {
@@ -164,6 +202,23 @@ fn dispatch(req: IpcRequest, store: &mut MemoryStore) -> IpcResponse {
             match result {
                 Ok((id, created)) => IpcResponse::Put { id, created },
                 Err(err) => store_error(err),
+            }
+        }
+        IpcRequest::PutFile {
+            path,
+            filename,
+            mime,
+        } => {
+            let mime = mime.unwrap_or_else(|| "application/octet-stream".into());
+            match std::fs::File::open(&path) {
+                Ok(file) => match store.put_file_reader(filename, mime, file) {
+                    Ok((id, created)) => IpcResponse::Put { id, created },
+                    Err(err) => store_error(err),
+                },
+                Err(err) => IpcResponse::Error {
+                    code: IpcErrorCode::Io,
+                    message: err.to_string(),
+                },
             }
         }
         IpcRequest::Ls => match store.ls() {
@@ -283,12 +338,10 @@ async fn handle_windows_pipe(
     store: Arc<Mutex<MemoryStore>>,
     notify: Arc<Notify>,
 ) -> Result<(), DaemonError> {
-    let mut line = String::new();
-    let n = {
-        let mut reader = BufReader::new(&mut stream);
-        reader.read_line(&mut line).await?
+    let Some(line) = read_bounded_utf8(&mut stream).await? else {
+        return Ok(());
     };
-    if n == 0 || line.trim().is_empty() || line.len() > shelf_core::MAX_FRAME_BYTES {
+    if line.trim().is_empty() {
         return Ok(());
     }
     let response = match serde_json::from_str::<IpcRequest>(line.trim_end()) {
@@ -296,6 +349,7 @@ async fn handle_windows_pipe(
             let mutated = matches!(
                 req,
                 IpcRequest::Put { .. }
+                    | IpcRequest::PutFile { .. }
                     | IpcRequest::Pin { .. }
                     | IpcRequest::Rm { .. }
                     | IpcRequest::ScratchAppend { .. }

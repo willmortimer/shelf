@@ -183,12 +183,18 @@ acknowledgement state
 
 Avoid exposing:
 
-- plaintext filenames,
+- plaintext filenames (not stored in SQLite `objects.name`; v3 envelopes keep names inside AEAD),
 - note titles,
 - content hashes of plaintext,
 - labels,
 - human-readable device names unless necessary,
 - object previews.
+
+Scratch pad ids are derived with a vault-keyed BLAKE3 index key, not `VaultId || name`.
+
+Peer TLS uses rustls/ring today (not PQ). Object encryption and enrollment wraps remain X25519 + ML-KEM-768. That is acceptable for transient sessions; the durable-data PQ layer is the one that matters.
+
+`shelfd` unlocks a passphrase vault with `--passphrase-fd` or `SHELF_PASSPHRASE` (never a passphrase argv).
 
 ## Plaintext hashing
 

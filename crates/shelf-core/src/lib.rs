@@ -6,6 +6,7 @@
 
 #![deny(missing_docs)]
 
+mod bounded;
 mod hexutil;
 
 pub mod blob;
@@ -28,12 +29,12 @@ pub use crypto::{
 pub use enrollment::{
     DeviceCapabilities, ENROLLMENT_PROTOCOL_VERSION, EncryptedMembershipState,
     EncryptedVaultKeyEnvelope, EnrollmentError, EnrollmentEvent, EnrollmentRequest,
-    EnrollmentState, MemberRole, MembershipCertificate, MembershipGrant, MembershipSnapshot,
-    SignatureBytes, TransportHint, VaultRoot,
+    EnrollmentState, MailboxBinding, MemberRole, MembershipCertificate, MembershipGrant,
+    MembershipSnapshot, SignatureBytes, TransportHint, VaultRoot,
 };
 pub use identity::{
     DeviceId, DevicePublicIdentity, HybridKemPublicKey, IdentityError, ML_KEM_768_PUBLIC_KEY_LEN,
-    MlKem768PublicKey, SigningPublicKey, VaultId, X25519PublicKey,
+    MlKem768PublicKey, SigningPublicKey, VaultId, X25519PublicKey, verify_ed25519,
 };
 pub use model::{
     ContentKind, ContentRef, HlcClock, HybridTimestamp, Label, ObjectId, ShelfItem, Timestamp,
@@ -41,11 +42,12 @@ pub use model::{
 
 /// Maximum newline-delimited JSON frame on IPC, mailbox, and peer sockets.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub use bounded::{BoundedLine, FrameTooLarge};
 pub use retention::{EPHEMERAL_TTL, ExpireObject, NORMAL_TTL, Retention, RetentionPolicy};
 pub use sync::{Peer, PeerId, PeerTransport};
 pub use transcript::{
     DOMAIN_ENROLL_CERT, DOMAIN_ENROLL_GENESIS, DOMAIN_ENROLL_REQUEST, DOMAIN_ENROLL_SAS,
-    DOMAIN_ENROLL_SNAPSHOT, DOMAIN_ENROLL_WRAP, Transcript,
+    DOMAIN_ENROLL_SNAPSHOT, DOMAIN_ENROLL_WRAP, DOMAIN_EPOCH_TRANSITION, Transcript,
 };
 
 #[cfg(test)]

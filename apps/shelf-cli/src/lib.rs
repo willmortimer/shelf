@@ -282,20 +282,20 @@ async fn cmd_put(
     kind: Option<ContentKind>,
     file: Option<PathBuf>,
 ) -> Result<(), CliError> {
-    let (bytes, default_kind, default_name) = if let Some(path) = file {
-        let bytes = fs::read(&path)?;
-        let default_name = path.file_name().and_then(|s| s.to_str()).map(str::to_owned);
-        (bytes, ContentKind::File, default_name)
+    let client = Client::connect(socket).await?;
+    let result = if let Some(path) = file {
+        let filename = name
+            .or_else(|| path.file_name().and_then(|s| s.to_str()).map(str::to_owned))
+            .unwrap_or_else(|| "file".into());
+        client
+            .put_file(&path, &filename, Some("application/octet-stream"))
+            .await?
     } else {
         let mut bytes = Vec::new();
         io::stdin().read_to_end(&mut bytes)?;
-        let kind = infer_kind(&bytes);
-        (bytes, kind, None)
+        let kind = kind.unwrap_or_else(|| infer_kind(&bytes));
+        client.put(&bytes, kind, name.as_deref()).await?
     };
-    let name = name.or(default_name);
-    let kind = kind.unwrap_or(default_kind);
-    let client = Client::connect(socket).await?;
-    let result = client.put(&bytes, kind, name.as_deref()).await?;
     writeln!(io::stdout(), "{}", result.id)?;
     Ok(())
 }

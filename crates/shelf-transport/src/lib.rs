@@ -20,12 +20,16 @@ use tokio::net::UdpSocket;
 mod frame;
 mod session;
 
-pub use frame::{OpBody, ReplicaFrame, SignedOperation, new_op_id, parse_sig_hex, sig_hex};
+pub use frame::{
+    OpBody, OriginCursor, PeerMessage, ReplicaFrame, SignedOperation, new_op_id, parse_sig_hex,
+    sig_hex,
+};
 pub use session::{
     SessionHello, accept_tls, connect_tls, hello_transcript, read_bounded_line,
     tls_exporter_client, tls_exporter_server, write_bounded_line,
 };
 pub use shelf_mailbox::{MailboxClient, MailboxError, MailboxItem};
+pub use shelf_protocol::DeviceEpochWrap;
 
 /// Transport failures.
 #[derive(Debug, Error)]
@@ -386,10 +390,10 @@ mod tests {
         tokio::spawn(accept_loop(listener, Arc::clone(&mailbox)));
         let client = MailboxClient::connect(addr.to_string()).await.unwrap();
         client
-            .put("vault", &id.to_string(), &payload, 60)
+            .put("vault", "w", &id.to_string(), &payload, 60)
             .await
             .unwrap();
-        let items = client.get("vault").await.unwrap();
+        let items = client.get("vault", "r").await.unwrap();
         assert_eq!(items.len(), 1);
         let rec: shelf_store::SealedRecord = serde_json::from_slice(&items[0].ciphertext).unwrap();
         b.ingest_envelope(

@@ -79,8 +79,10 @@ pub struct KeyEnvelope {
     /// AEAD used for the wrap. v1 is XChaCha20-Poly1305 only.
     pub algorithm: AeadAlgorithm,
     /// Wrap nonce (24 bytes for XChaCha20-Poly1305).
+    #[serde(with = "crate::b64")]
     pub nonce: Vec<u8>,
     /// AEAD ciphertext of the DEK (32-byte plaintext plus 16-byte tag).
+    #[serde(with = "crate::b64")]
     pub ciphertext: Vec<u8>,
 }
 

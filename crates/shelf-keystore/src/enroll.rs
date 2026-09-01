@@ -4,8 +4,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use shelf_core::enrollment::{
     DeviceCapabilities, ENROLLMENT_PROTOCOL_VERSION, EncryptedVaultKeyEnvelope, EnrollmentRequest,
-    MemberRole, MembershipCertificate, MembershipGrant, MembershipSnapshot, SignatureBytes,
-    TransportHint, VaultRoot,
+    MailboxBinding, MemberRole, MembershipCertificate, MembershipGrant, MembershipSnapshot,
+    SignatureBytes, TransportHint, VaultRoot,
 };
 use shelf_core::{
     DOMAIN_ENROLL_GENESIS, DOMAIN_ENROLL_SAS, DOMAIN_ENROLL_WRAP, HybridKemPublicKey, Timestamp,
@@ -82,6 +82,11 @@ pub fn ensure_local_root(vault: &mut Vault) -> Result<VaultRoot, KeystoreError> 
         .store
         .put_member(&cert)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    let snapshot = sign_snapshot(vault, &root, vec![cert], 1, None, None)?;
+    vault
+        .store
+        .save_membership_snapshot(&snapshot)
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     Ok(root)
 }
 
@@ -105,6 +110,14 @@ pub fn export_join(
         capabilities: DeviceCapabilities::default(),
         nonce,
         expires_at,
+        mailbox_id: vault
+            .store
+            .mailbox_id()
+            .map_err(|e| KeystoreError::Identity(e.to_string()))?,
+        mailbox_write_cap: vault
+            .store
+            .mailbox_write_cap()
+            .map_err(|e| KeystoreError::Identity(e.to_string()))?,
         self_signature: SignatureBytes::from_bytes([0; 64]),
     };
     let body = req.transcript();
@@ -147,7 +160,7 @@ pub fn approve_join(
         kem_pubkey: join.request.kem_pubkey.clone(),
         role: MemberRole::Member,
         capabilities: join.request.capabilities.clone(),
-        serial: 2,
+        serial: next_serial(vault)?,
         epoch: vault.store.epoch(),
         issuer: issuer_id.device_id,
         issuer_signing_pubkey: issuer_id.signing_pubkey,
@@ -161,22 +174,21 @@ pub fn approve_join(
         .store
         .put_member(&cert)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    let mut members = vault
+    let members = vault
         .store
         .members()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    if !members.iter().any(|c| c.device_id == cert.device_id) {
-        members.push(cert.clone());
-    }
-    let mut snapshot = MembershipSnapshot {
-        vault_root: root.clone(),
-        generation: root.generation,
-        epoch: vault.store.epoch(),
-        certificates: members,
-        snapshot_signature: SignatureBytes::from_bytes([0; 64]),
-    };
-    let snap_body = snapshot.transcript();
-    snapshot.snapshot_signature = SignatureBytes::from_bytes(vault.keys.sign(snap_body.as_bytes()));
+    let generation = vault
+        .store
+        .membership_snapshot()
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?
+        .map(|s| s.generation.saturating_add(1))
+        .unwrap_or(2);
+    let snapshot = sign_snapshot(vault, &root, members, generation, Some(join), None)?;
+    vault
+        .store
+        .save_membership_snapshot(&snapshot)
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     let wrap_aad = wrap_aad(&root, &cert, request_hash);
     let wrap = wrap_epoch_key(
         vault.store.epoch_key().as_bytes(),
@@ -256,6 +268,10 @@ pub fn import_grant(
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     vault
         .store
+        .save_membership_snapshot(&grant.grant.snapshot)
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    vault
+        .store
         .clear_pending_request_hash()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     Ok(())
@@ -293,6 +309,77 @@ fn genesis_request_hash(root: &VaultRoot, device_id: shelf_core::DeviceId) -> [u
     t.push_fixed(root.transcript().as_bytes());
     t.push_fixed(device_id.as_bytes());
     t.hash()
+}
+
+fn next_serial(vault: &Vault) -> Result<u64, KeystoreError> {
+    let members = vault
+        .store
+        .members()
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    Ok(members
+        .iter()
+        .map(|c| c.serial)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1))
+}
+
+pub(crate) fn sign_snapshot(
+    vault: &Vault,
+    root: &VaultRoot,
+    certificates: Vec<MembershipCertificate>,
+    generation: u64,
+    join: Option<&ShelfJoin>,
+    exclude: Option<shelf_core::DeviceId>,
+) -> Result<MembershipSnapshot, KeystoreError> {
+    let mut mailbox_bindings = vault
+        .store
+        .membership_snapshot()
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?
+        .map(|s| s.mailbox_bindings)
+        .unwrap_or_default();
+    mailbox_bindings.extend(mailbox_bindings_local(vault)?);
+    if let Some(join) = join
+        && !join.request.mailbox_id.is_empty()
+    {
+        mailbox_bindings.push(MailboxBinding {
+            device_id: join.request.device_id,
+            mailbox_id: join.request.mailbox_id.clone(),
+            write_cap: join.request.mailbox_write_cap.clone(),
+        });
+    }
+    mailbox_bindings.sort_by(|a, b| a.device_id.as_bytes().cmp(b.device_id.as_bytes()));
+    mailbox_bindings.dedup_by(|a, b| a.device_id == b.device_id);
+    if let Some(id) = exclude {
+        mailbox_bindings.retain(|b| b.device_id != id);
+    }
+    let mut snapshot = MembershipSnapshot {
+        vault_root: root.clone(),
+        generation,
+        epoch: vault.store.epoch(),
+        certificates,
+        mailbox_bindings,
+        snapshot_signature: SignatureBytes::from_bytes([0; 64]),
+    };
+    let body = snapshot.transcript();
+    snapshot.snapshot_signature = SignatureBytes::from_bytes(vault.keys.sign(body.as_bytes()));
+    Ok(snapshot)
+}
+
+fn mailbox_bindings_local(vault: &Vault) -> Result<Vec<MailboxBinding>, KeystoreError> {
+    let mid = vault
+        .store
+        .mailbox_id()
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    let write = vault
+        .store
+        .mailbox_write_cap()
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    Ok(vec![MailboxBinding {
+        device_id: vault.keys.public_identity().device_id,
+        mailbox_id: mid,
+        write_cap: write,
+    }])
 }
 
 fn sign_certificate(

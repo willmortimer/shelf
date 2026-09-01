@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use shelf_core::{ContentKind, ObjectId};
 #[cfg(any(unix, windows))]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ClientError;
 use crate::ipc::{GetTarget, IpcRequest, IpcResponse, ListedItem, ObjectPayload, PutResult};
@@ -57,6 +57,32 @@ impl Client {
             | IpcResponse::Scratch { .. } => {
                 Err(ClientError::Protocol("unexpected response for put".into()))
             }
+        }
+    }
+
+    /// Ask the daemon to stream-seal a local file (never sent over IPC).
+    pub async fn put_file(
+        &self,
+        path: &Path,
+        filename: &str,
+        mime: Option<&str>,
+    ) -> Result<PutResult, ClientError> {
+        let req = IpcRequest::PutFile {
+            path: path.to_string_lossy().into_owned(),
+            filename: filename.to_owned(),
+            mime: mime.map(str::to_owned),
+        };
+        match rpc(&self.path, &req).await? {
+            IpcResponse::Put { id, created } => Ok(PutResult { id, created }),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            IpcResponse::Ls { .. }
+            | IpcResponse::Latest { .. }
+            | IpcResponse::Get { .. }
+            | IpcResponse::Pin { .. }
+            | IpcResponse::Rm { .. }
+            | IpcResponse::Scratch { .. } => Err(ClientError::Protocol(
+                "unexpected response for put_file".into(),
+            )),
         }
     }
 
@@ -214,21 +240,18 @@ async fn rpc(path: &Path, req: &IpcRequest) -> Result<IpcResponse, ClientError> 
     #[cfg(unix)]
     {
         let stream = tokio::net::UnixStream::connect(path).await?;
-        let (reader, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = stream.into_split();
         let mut json =
             serde_json::to_string(req).map_err(|e| ClientError::Protocol(e.to_string()))?;
         json.push('\n');
         writer.write_all(json.as_bytes()).await?;
         writer.flush().await?;
 
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 || line.len() > shelf_core::MAX_FRAME_BYTES {
+        let Some(line) = read_bounded_utf8(&mut reader).await? else {
             return Err(ClientError::Protocol(
                 "empty or oversized response from daemon".into(),
             ));
-        }
+        };
         serde_json::from_str(line.trim_end()).map_err(|e| ClientError::Decode(e.to_string()))
     }
     #[cfg(windows)]
@@ -239,20 +262,48 @@ async fn rpc(path: &Path, req: &IpcRequest) -> Result<IpcResponse, ClientError> 
         json.push('\n');
         stream.write_all(json.as_bytes()).await?;
         stream.flush().await?;
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 || line.len() > shelf_core::MAX_FRAME_BYTES {
+        let Some(line) = read_bounded_utf8(&mut stream).await? else {
             return Err(ClientError::Protocol(
                 "empty or oversized response from daemon".into(),
             ));
-        }
+        };
         serde_json::from_str(line.trim_end()).map_err(|e| ClientError::Decode(e.to_string()))
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, req);
         Err(ClientError::UnsupportedOs)
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn read_bounded_utf8<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<String>, ClientError> {
+    let mut acc = shelf_core::BoundedLine::new();
+    let mut any = false;
+    loop {
+        let mut byte = [0u8; 1];
+        let n = reader.read(&mut byte).await?;
+        if n == 0 {
+            return if any {
+                Err(ClientError::Protocol("truncated IPC frame".into()))
+            } else {
+                Ok(None)
+            };
+        }
+        any = true;
+        match acc.push(byte[0]) {
+            Ok(Some(buf)) => {
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Err(ClientError::Protocol(
+                    "empty or oversized response from daemon".into(),
+                ));
+            }
+        }
     }
 }
 

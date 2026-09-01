@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 /// Mailbox failures.
@@ -28,6 +28,9 @@ pub enum MailboxError {
     /// Mailbox is over quota.
     #[error("mailbox over quota")]
     Quota,
+    /// Write or read capability did not match.
+    #[error("mailbox capability denied")]
+    Denied,
 }
 
 /// One ciphertext item. The mailbox never inspects the payload.
@@ -65,6 +68,8 @@ pub enum MailboxRequest {
     Put {
         /// Opaque mailbox identifier (not a vault secret).
         mailbox_id: String,
+        /// Capability required to deposit (bound on first PUT).
+        write_cap: String,
         /// Opaque object id.
         object_id: String,
         /// Ciphertext (Base64 on the wire).
@@ -77,11 +82,15 @@ pub enum MailboxRequest {
     Get {
         /// Opaque mailbox identifier.
         mailbox_id: String,
+        /// Capability required to drain (bound on first GET).
+        read_cap: String,
     },
     /// Drop an item after a replica has ingested it.
     Ack {
         /// Opaque mailbox identifier.
         mailbox_id: String,
+        /// Capability required to drain.
+        read_cap: String,
         /// Opaque object id.
         object_id: String,
     },
@@ -110,10 +119,26 @@ struct Stored {
     expires_unix: u64,
 }
 
+#[derive(Default)]
+struct Slot {
+    write_cap: Option<String>,
+    read_cap: Option<String>,
+    items: HashMap<String, Stored>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct DiskMailbox {
     v: u16,
-    slots: HashMap<String, HashMap<String, DiskItem>>,
+    slots: HashMap<String, DiskSlot>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiskSlot {
+    #[serde(default)]
+    write_cap: Option<String>,
+    #[serde(default)]
+    read_cap: Option<String>,
+    items: HashMap<String, DiskItem>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,7 +158,7 @@ pub const MAX_MAILBOX_BYTES: usize = 64 * 1024 * 1024;
 /// Ciphertext queue with caps and optional disk persist.
 pub struct Mailbox {
     path: Option<PathBuf>,
-    inner: Mutex<HashMap<String, HashMap<String, Stored>>>,
+    inner: Mutex<HashMap<String, Slot>>,
 }
 
 impl Default for Mailbox {
@@ -166,28 +191,34 @@ impl Mailbox {
         })
     }
 
-    fn persist(path: Option<&Path>, map: &HashMap<String, HashMap<String, Stored>>) {
+    fn persist(path: Option<&Path>, map: &HashMap<String, Slot>) {
         let Some(path) = path else {
             return;
         };
         let disk = DiskMailbox {
-            v: 1,
+            v: 2,
             slots: map
                 .iter()
                 .map(|(mid, slot)| {
                     (
                         mid.clone(),
-                        slot.iter()
-                            .map(|(oid, stored)| {
-                                (
-                                    oid.clone(),
-                                    DiskItem {
-                                        ciphertext: stored.ciphertext.clone(),
-                                        expires_unix: stored.expires_unix,
-                                    },
-                                )
-                            })
-                            .collect(),
+                        DiskSlot {
+                            write_cap: slot.write_cap.clone(),
+                            read_cap: slot.read_cap.clone(),
+                            items: slot
+                                .items
+                                .iter()
+                                .map(|(oid, stored)| {
+                                    (
+                                        oid.clone(),
+                                        DiskItem {
+                                            ciphertext: stored.ciphertext.clone(),
+                                            expires_unix: stored.expires_unix,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        },
                     )
                 })
                 .collect(),
@@ -213,10 +244,11 @@ impl Mailbox {
         map.retain(|_, v| v.expires_unix > now);
     }
 
-    /// PUT.
+    /// PUT. First PUT binds `write_cap`; later PUTs must match.
     pub fn put(
         &self,
         mailbox_id: &str,
+        write_cap: &str,
         object_id: String,
         ciphertext: Vec<u8>,
         ttl_secs: u64,
@@ -230,12 +262,21 @@ impl Mailbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Self::now();
         let slot = inner.entry(mailbox_id.to_owned()).or_default();
-        Self::gc(slot, now);
-        let used: usize = slot.values().map(|s| s.ciphertext.len()).sum();
-        if slot.len() >= MAX_ITEMS || used.saturating_add(ciphertext.len()) > MAX_MAILBOX_BYTES {
+        if let Some(bound) = slot.write_cap.as_deref() {
+            if bound != write_cap {
+                return Err(MailboxError::Denied);
+            }
+        } else {
+            slot.write_cap = Some(write_cap.to_owned());
+        }
+        Self::gc(&mut slot.items, now);
+        let used: usize = slot.items.values().map(|s| s.ciphertext.len()).sum();
+        if slot.items.len() >= MAX_ITEMS
+            || used.saturating_add(ciphertext.len()) > MAX_MAILBOX_BYTES
+        {
             return Err(MailboxError::Quota);
         }
-        slot.insert(
+        slot.items.insert(
             object_id,
             Stored {
                 ciphertext,
@@ -246,61 +287,123 @@ impl Mailbox {
         Ok(())
     }
 
-    /// GET (does not remove).
-    pub fn get(&self, mailbox_id: &str) -> Vec<MailboxItem> {
+    /// GET (does not remove). First GET binds `read_cap`.
+    pub fn get(&self, mailbox_id: &str, read_cap: &str) -> Result<Vec<MailboxItem>, MailboxError> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Self::now();
-        let Some(slot) = inner.get_mut(mailbox_id) else {
-            return Vec::new();
-        };
-        Self::gc(slot, now);
-        slot.iter()
+        let slot = inner.entry(mailbox_id.to_owned()).or_default();
+        if let Some(bound) = slot.read_cap.as_deref() {
+            if bound != read_cap {
+                return Err(MailboxError::Denied);
+            }
+        } else if !read_cap.is_empty() {
+            slot.read_cap = Some(read_cap.to_owned());
+        } else {
+            return Err(MailboxError::Denied);
+        }
+        Self::gc(&mut slot.items, now);
+        let items: Vec<MailboxItem> = slot
+            .items
+            .iter()
             .map(|(id, stored)| MailboxItem {
                 object_id: id.clone(),
                 ciphertext: stored.ciphertext.clone(),
             })
-            .collect()
+            .collect();
+        Self::persist(self.path.as_deref(), &inner);
+        Ok(items)
     }
 
     /// ACK.
-    pub fn ack(&self, mailbox_id: &str, object_id: &str) {
+    pub fn ack(
+        &self,
+        mailbox_id: &str,
+        read_cap: &str,
+        object_id: &str,
+    ) -> Result<(), MailboxError> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(slot) = inner.get_mut(mailbox_id) {
-            slot.remove(object_id);
+        let slot = inner.entry(mailbox_id.to_owned()).or_default();
+        if let Some(bound) = slot.read_cap.as_deref() {
+            if bound != read_cap {
+                return Err(MailboxError::Denied);
+            }
+        } else if !read_cap.is_empty() {
+            slot.read_cap = Some(read_cap.to_owned());
+        } else {
+            return Err(MailboxError::Denied);
         }
+        slot.items.remove(object_id);
         Self::persist(self.path.as_deref(), &inner);
+        Ok(())
     }
 }
 
-fn load_disk(path: &Path) -> Result<HashMap<String, HashMap<String, Stored>>, MailboxError> {
+fn load_disk(path: &Path) -> Result<HashMap<String, Slot>, MailboxError> {
     let bytes = fs::read(path)?;
     if bytes.is_empty() {
         return Ok(HashMap::new());
     }
-    let disk: DiskMailbox = serde_json::from_slice(&bytes)?;
+    if let Ok(disk) = serde_json::from_slice::<DiskMailbox>(&bytes) {
+        return Ok(disk
+            .slots
+            .into_iter()
+            .map(|(mid, slot)| {
+                (
+                    mid,
+                    Slot {
+                        write_cap: slot.write_cap,
+                        read_cap: slot.read_cap,
+                        items: slot
+                            .items
+                            .into_iter()
+                            .map(|(oid, item)| {
+                                (
+                                    oid,
+                                    Stored {
+                                        ciphertext: item.ciphertext,
+                                        expires_unix: item.expires_unix,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect());
+    }
+    #[derive(Deserialize)]
+    struct DiskV1 {
+        slots: HashMap<String, HashMap<String, DiskItem>>,
+    }
+    let disk: DiskV1 = serde_json::from_slice(&bytes)?;
     Ok(disk
         .slots
         .into_iter()
-        .map(|(mid, slot)| {
+        .map(|(mid, items)| {
             (
                 mid,
-                slot.into_iter()
-                    .map(|(oid, item)| {
-                        (
-                            oid,
-                            Stored {
-                                ciphertext: item.ciphertext,
-                                expires_unix: item.expires_unix,
-                            },
-                        )
-                    })
-                    .collect(),
+                Slot {
+                    write_cap: None,
+                    read_cap: None,
+                    items: items
+                        .into_iter()
+                        .map(|(oid, item)| {
+                            (
+                                oid,
+                                Stored {
+                                    ciphertext: item.ciphertext,
+                                    expires_unix: item.expires_unix,
+                                },
+                            )
+                        })
+                        .collect(),
+                },
             )
         })
         .collect())
@@ -329,46 +432,81 @@ fn tracing_warn(err: MailboxError) {
     eprintln!("shelf-mailbox: {err}");
 }
 
-async fn handle(stream: TcpStream, mailbox: Arc<Mailbox>) -> Result<(), MailboxError> {
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 || line.len() > MAX_ITEM_BYTES {
-        return Ok(());
+async fn read_bounded_line(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, MailboxError> {
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Err(MailboxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated mailbox frame",
+                )))
+            };
+        }
+        if buf.len() >= MAX_ITEM_BYTES {
+            return Err(MailboxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mailbox frame exceeds MAX_ITEM_BYTES",
+            )));
+        }
+        buf.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(Some(buf));
+        }
     }
-    let response = match serde_json::from_str::<MailboxRequest>(line.trim_end()) {
+}
+
+async fn handle(mut stream: TcpStream, mailbox: Arc<Mailbox>) -> Result<(), MailboxError> {
+    let Some(line) = read_bounded_line(&mut stream).await? else {
+        return Ok(());
+    };
+    let slice = line.strip_suffix(b"\n").unwrap_or(&line);
+    let response = match serde_json::from_slice::<MailboxRequest>(slice) {
         Ok(MailboxRequest::Put {
             mailbox_id,
+            write_cap,
             object_id,
             ciphertext,
             ttl_secs,
         }) => mailbox
-            .put(&mailbox_id, object_id, ciphertext, ttl_secs)
+            .put(&mailbox_id, &write_cap, object_id, ciphertext, ttl_secs)
             .map_or_else(
                 |e| MailboxResponse::Error {
                     message: e.to_string(),
                 },
                 |()| MailboxResponse::Ok,
             ),
-        Ok(MailboxRequest::Get { mailbox_id }) => MailboxResponse::Items {
-            items: mailbox.get(&mailbox_id),
-        },
+        Ok(MailboxRequest::Get {
+            mailbox_id,
+            read_cap,
+        }) => mailbox.get(&mailbox_id, &read_cap).map_or_else(
+            |e| MailboxResponse::Error {
+                message: e.to_string(),
+            },
+            |items| MailboxResponse::Items { items },
+        ),
         Ok(MailboxRequest::Ack {
             mailbox_id,
+            read_cap,
             object_id,
-        }) => {
-            mailbox.ack(&mailbox_id, &object_id);
-            MailboxResponse::Ok
-        }
+        }) => mailbox.ack(&mailbox_id, &read_cap, &object_id).map_or_else(
+            |e| MailboxResponse::Error {
+                message: e.to_string(),
+            },
+            |()| MailboxResponse::Ok,
+        ),
         Err(err) => MailboxResponse::Error {
             message: err.to_string(),
         },
     };
     let mut json = serde_json::to_string(&response)?;
     json.push('\n');
-    writer.write_all(json.as_bytes()).await?;
-    writer.flush().await?;
+    stream.write_all(json.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }
 
@@ -386,16 +524,18 @@ impl MailboxClient {
         Ok(Self { addr })
     }
 
-    /// PUT ciphertext.
+    /// PUT ciphertext using the mailbox write capability.
     pub async fn put(
         &self,
         mailbox_id: &str,
+        write_cap: &str,
         object_id: &str,
         ciphertext: &[u8],
         ttl_secs: u64,
     ) -> Result<(), MailboxError> {
         let req = MailboxRequest::Put {
             mailbox_id: mailbox_id.to_owned(),
+            write_cap: write_cap.to_owned(),
             object_id: object_id.to_owned(),
             ciphertext: ciphertext.to_vec(),
             ttl_secs,
@@ -411,10 +551,15 @@ impl MailboxClient {
         }
     }
 
-    /// GET items.
-    pub async fn get(&self, mailbox_id: &str) -> Result<Vec<MailboxItem>, MailboxError> {
+    /// GET items using the mailbox read capability.
+    pub async fn get(
+        &self,
+        mailbox_id: &str,
+        read_cap: &str,
+    ) -> Result<Vec<MailboxItem>, MailboxError> {
         let req = MailboxRequest::Get {
             mailbox_id: mailbox_id.to_owned(),
+            read_cap: read_cap.to_owned(),
         };
         match rpc(&self.addr, &req).await? {
             MailboxResponse::Items { items } => Ok(items),
@@ -425,10 +570,16 @@ impl MailboxClient {
         }
     }
 
-    /// ACK an item.
-    pub async fn ack(&self, mailbox_id: &str, object_id: &str) -> Result<(), MailboxError> {
+    /// ACK an item using the mailbox read capability.
+    pub async fn ack(
+        &self,
+        mailbox_id: &str,
+        read_cap: &str,
+        object_id: &str,
+    ) -> Result<(), MailboxError> {
         let req = MailboxRequest::Ack {
             mailbox_id: mailbox_id.to_owned(),
+            read_cap: read_cap.to_owned(),
             object_id: object_id.to_owned(),
         };
         match rpc(&self.addr, &req).await? {
@@ -442,21 +593,18 @@ impl MailboxClient {
 }
 
 async fn rpc(addr: &str, req: &MailboxRequest) -> Result<MailboxResponse, MailboxError> {
-    let stream = TcpStream::connect(addr).await?;
-    let (reader, mut writer) = stream.into_split();
+    let mut stream = TcpStream::connect(addr).await?;
     let mut json = serde_json::to_string(req)?;
     json.push('\n');
-    writer.write_all(json.as_bytes()).await?;
-    writer.flush().await?;
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
+    stream.write_all(json.as_bytes()).await?;
+    stream.flush().await?;
+    let Some(line) = read_bounded_line(&mut stream).await? else {
         return Err(MailboxError::Io(std::io::Error::other(
             "empty mailbox response",
         )));
-    }
-    Ok(serde_json::from_str(line.trim_end())?)
+    };
+    let slice = line.strip_suffix(b"\n").unwrap_or(&line);
+    Ok(serde_json::from_slice(slice)?)
 }
 
 #[cfg(test)]
@@ -480,15 +628,15 @@ mod tests {
         });
         let client = MailboxClient::connect(addr.to_string()).await.unwrap();
         client
-            .put("mid", "obj1", b"ciphertext-only", 60)
+            .put("mid", "write", "obj1", b"ciphertext-only", 60)
             .await
             .unwrap();
-        let items = client.get("mid").await.unwrap();
+        let items = client.get("mid", "read").await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].ciphertext, b"ciphertext-only");
         assert!(!String::from_utf8_lossy(&serde_json::to_vec(&items[0]).unwrap()).is_empty());
-        client.ack("mid", "obj1").await.unwrap();
-        assert!(client.get("mid").await.unwrap().is_empty());
+        client.ack("mid", "read", "obj1").await.unwrap();
+        assert!(client.get("mid", "read").await.unwrap().is_empty());
     }
 
     #[test]
@@ -496,8 +644,20 @@ mod tests {
         let mailbox = Mailbox::new();
         let big = vec![1u8; MAX_ITEM_BYTES + 1];
         assert!(matches!(
-            mailbox.put("mid", "x".into(), big, 60),
+            mailbox.put("mid", "w", "x".into(), big, 60),
             Err(MailboxError::Quota)
+        ));
+    }
+
+    #[test]
+    fn wrong_write_cap_is_denied() {
+        let mailbox = Mailbox::new();
+        mailbox
+            .put("mid", "w1", "x".into(), b"ct".to_vec(), 60)
+            .unwrap();
+        assert!(matches!(
+            mailbox.put("mid", "w2", "y".into(), b"ct".to_vec(), 60),
+            Err(MailboxError::Denied)
         ));
     }
 
@@ -508,11 +668,11 @@ mod tests {
         let path = dir.join("mailbox.json");
         let mailbox = Mailbox::open(&path).unwrap();
         mailbox
-            .put("mid", "obj1".into(), b"ciphertext-only".to_vec(), 60)
+            .put("mid", "w", "obj1".into(), b"ciphertext-only".to_vec(), 60)
             .unwrap();
         drop(mailbox);
         let reopened = Mailbox::open(&path).unwrap();
-        let items = reopened.get("mid");
+        let items = reopened.get("mid", "r").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].ciphertext, b"ciphertext-only");
         let _ = std::fs::remove_dir_all(&dir);

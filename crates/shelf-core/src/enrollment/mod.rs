@@ -105,6 +105,12 @@ pub struct EnrollmentRequest {
     pub nonce: [u8; 32],
     /// Request expiry.
     pub expires_at: Timestamp,
+    /// Joiner mailbox receive id (hex). Empty if unused.
+    #[serde(default)]
+    pub mailbox_id: String,
+    /// Capability required to PUT to the joiner mailbox (hex).
+    #[serde(default)]
+    pub mailbox_write_cap: String,
     /// Signature over the request transcript by `signing_pubkey`.
     pub self_signature: SignatureBytes,
 }
@@ -149,6 +155,8 @@ impl EnrollmentRequest {
         );
         t.push_fixed(&self.nonce);
         t.push_u64(self.expires_at.as_millis());
+        t.push_bytes(self.mailbox_id.as_bytes());
+        t.push_bytes(self.mailbox_write_cap.as_bytes());
         t
     }
 }
@@ -222,8 +230,22 @@ pub struct MembershipSnapshot {
     pub epoch: EpochId,
     /// Valid member certificates (root device + joiner at minimum).
     pub certificates: Vec<MembershipCertificate>,
+    /// Per-device mailbox receive address and write capability.
+    #[serde(default)]
+    pub mailbox_bindings: Vec<MailboxBinding>,
     /// Root signature over [`Self::transcript`].
     pub snapshot_signature: SignatureBytes,
+}
+
+/// Mailbox receive address advertised to other members (write cap only).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxBinding {
+    /// Device that owns this mailbox.
+    pub device_id: DeviceId,
+    /// Opaque mailbox id (hex).
+    pub mailbox_id: String,
+    /// Capability required to PUT into this mailbox (hex).
+    pub write_cap: String,
 }
 
 impl MembershipSnapshot {
@@ -240,7 +262,31 @@ impl MembershipSnapshot {
         for cert in &certs {
             t.push_bytes(cert.transcript().as_bytes());
         }
+        t.push_u16(u16::try_from(self.mailbox_bindings.len()).unwrap_or(u16::MAX));
+        let mut binds = self.mailbox_bindings.clone();
+        binds.sort_by(|a, b| a.device_id.as_bytes().cmp(b.device_id.as_bytes()));
+        for b in &binds {
+            t.push_fixed(b.device_id.as_bytes());
+            t.push_bytes(b.mailbox_id.as_bytes());
+            t.push_bytes(b.write_cap.as_bytes());
+        }
         t
+    }
+
+    /// Verify this snapshot against `root`.
+    #[must_use]
+    pub fn verify(&self, root: &VaultRoot) -> bool {
+        if self.vault_root != *root {
+            return false;
+        }
+        if self.vault_root.vault_id != root.vault_id {
+            return false;
+        }
+        crate::identity::verify_ed25519(
+            &root.root_signing_pubkey,
+            self.transcript().as_bytes(),
+            self.snapshot_signature.as_bytes(),
+        )
     }
 }
 

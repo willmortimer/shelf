@@ -65,6 +65,16 @@ impl TryFrom<SigningPublicKey> for ed25519_dalek::VerifyingKey {
     }
 }
 
+/// Verify an Ed25519 signature over `msg`.
+#[must_use]
+pub fn verify_ed25519(pk: &SigningPublicKey, msg: &[u8], sig: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let Ok(vk) = VerifyingKey::try_from(*pk) else {
+        return false;
+    };
+    vk.verify_strict(msg, &Signature::from_bytes(sig)).is_ok()
+}
+
 impl From<ed25519_dalek::VerifyingKey> for SigningPublicKey {
     fn from(value: ed25519_dalek::VerifyingKey) -> Self {
         Self(value.to_bytes())

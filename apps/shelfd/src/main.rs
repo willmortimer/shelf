@@ -21,6 +21,9 @@ struct Args {
     /// Allow 0600 `wrap.key` if the platform store is unavailable (unsafe).
     #[arg(long)]
     allow_file_key: bool,
+    /// Read a passphrase from this file descriptor (not argv).
+    #[arg(long)]
+    passphrase_fd: Option<i32>,
 }
 
 #[tokio::main]
@@ -41,7 +44,38 @@ async fn run() -> Result<(), DaemonError> {
         None => default_shelf_home()?,
     };
     let socket = resolve_socket_path(args.socket, args.home)?;
-    let vault = open_or_create_vault(&home, None, None, args.allow_file_key)?;
+    let passphrase = read_passphrase(args.passphrase_fd)?;
+    let vault = open_or_create_vault(&home, None, passphrase.as_deref(), args.allow_file_key)?;
     let signer = vault.keys.device_signer();
     serve_with_replica(socket, vault.store, home, signer).await
+}
+
+fn read_passphrase(fd: Option<i32>) -> Result<Option<String>, DaemonError> {
+    if let Some(fd) = fd {
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            use std::os::unix::io::{FromRawFd, RawFd};
+            // SAFETY: `--passphrase-fd` is an open descriptor the caller transfers to us.
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd as RawFd) };
+            let mut s = String::new();
+            file.read_to_string(&mut s)?;
+            let s = s.trim_end_matches(['\n', '\r']).to_owned();
+            if s.is_empty() {
+                return Err(DaemonError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "empty passphrase on --passphrase-fd",
+                )));
+            }
+            return Ok(Some(s));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+            return Err(DaemonError::UnsupportedOs);
+        }
+    }
+    Ok(std::env::var("SHELF_PASSPHRASE")
+        .ok()
+        .filter(|s| !s.is_empty()))
 }

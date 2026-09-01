@@ -1,7 +1,10 @@
 //! Hybrid (X25519 + ML-KEM-768) wrap of a vault epoch key for enrollment.
 
 use serde::{Deserialize, Serialize};
-use shelf_core::{HybridKemPublicKey, ML_KEM_768_PUBLIC_KEY_LEN};
+use shelf_core::{
+    DOMAIN_EPOCH_TRANSITION, DeviceId, EpochId, HybridKemPublicKey, ML_KEM_768_PUBLIC_KEY_LEN,
+    MembershipSnapshot, Transcript, VaultId,
+};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::cipher::{open_xchacha, seal_xchacha};
@@ -13,11 +16,53 @@ pub struct HybridEpochWrap {
     /// Approver ephemeral X25519 public key.
     pub x25519_ephemeral: [u8; 32],
     /// ML-KEM-768 ciphertext.
+    #[serde(with = "crate::b64")]
     pub ml_kem_ciphertext: Vec<u8>,
     /// AEAD nonce.
     pub nonce: [u8; 24],
     /// AEAD ciphertext of the 32-byte epoch key.
+    #[serde(with = "crate::b64")]
     pub ciphertext: Vec<u8>,
+}
+
+/// New epoch key wrapped to one remaining member.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEpochWrap {
+    /// Recipient device.
+    pub device_id: DeviceId,
+    /// Hybrid wrap of the new epoch secret.
+    pub wrap: HybridEpochWrap,
+}
+
+/// AEAD AAD for epoch-transition wraps (vault + epochs + revoked device).
+#[must_use]
+pub fn epoch_transition_aad(
+    vault_id: VaultId,
+    old_epoch: EpochId,
+    new_epoch: EpochId,
+    revoked: DeviceId,
+) -> Vec<u8> {
+    let mut t = Transcript::new(DOMAIN_EPOCH_TRANSITION);
+    t.push_fixed(vault_id.as_bytes());
+    t.push_u64(old_epoch.as_u64());
+    t.push_u64(new_epoch.as_u64());
+    t.push_fixed(revoked.as_bytes());
+    t.as_bytes().to_vec()
+}
+
+/// Payload for a root-authorized epoch rotation (persisted then signed as an op).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EpochTransitionPayload {
+    /// Epoch before rotation.
+    pub old_epoch: EpochId,
+    /// Epoch after rotation.
+    pub new_epoch: EpochId,
+    /// Device removed from the vault.
+    pub revoked: DeviceId,
+    /// Root-signed membership after the revoke.
+    pub snapshot: MembershipSnapshot,
+    /// Hybrid wraps of the new epoch secret, one per remaining device.
+    pub envelopes: Vec<DeviceEpochWrap>,
 }
 
 /// Wrap `epoch_key` to `recipient` (joining device public hybrid KEM).

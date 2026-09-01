@@ -1,10 +1,7 @@
 //! Integration: `shelf` binary against `shelfd::serve` on a temp socket.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::process::{Command, Output};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_shelf"))
@@ -35,6 +32,12 @@ fn help_lists_core_commands() {
 #[cfg(unix)]
 mod ipc {
     use super::*;
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
     use shelf_client::Client;
     use shelfd::{MemoryStore, serve};
 

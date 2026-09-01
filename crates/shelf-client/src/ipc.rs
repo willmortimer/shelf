@@ -70,6 +70,17 @@ pub enum IpcRequest {
         /// Text to insert at the current end.
         text: String,
     },
+    /// Seal a local file by path (daemon streams 4 MiB chunks; the IPC line
+    /// never carries the file bytes).
+    PutFile {
+        /// Absolute path the daemon can open.
+        path: String,
+        /// Display filename stored in the file manifest.
+        filename: String,
+        /// MIME type. Defaults to `application/octet-stream`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
+    },
 }
 
 fn default_scratch_name() -> String {
@@ -95,6 +106,16 @@ impl fmt::Debug for IpcRequest {
                 .debug_struct("ScratchAppend")
                 .field("name", name)
                 .field("text_len", &text.len())
+                .finish(),
+            Self::PutFile {
+                path,
+                filename,
+                mime,
+            } => f
+                .debug_struct("PutFile")
+                .field("path", path)
+                .field("filename", filename)
+                .field("mime", mime)
                 .finish(),
         }
     }
