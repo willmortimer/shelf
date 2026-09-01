@@ -71,6 +71,9 @@ pub enum Custody {
 pub struct DeviceSigner {
     device_id: DeviceId,
     signing: SigningKey,
+    x25519: x25519_dalek::StaticSecret,
+    ml_kem_dk: Vec<u8>,
+    wrap_key: [u8; 32],
 }
 
 impl DeviceSigner {
@@ -90,6 +93,21 @@ impl DeviceSigner {
     #[must_use]
     pub fn verifying_key(&self) -> SigningPublicKey {
         SigningPublicKey::from(self.signing.verifying_key())
+    }
+
+    /// Unwrap a hybrid epoch wrap addressed to this device.
+    pub fn unwrap_epoch(
+        &self,
+        wrap: &shelf_protocol::HybridEpochWrap,
+        aad: &[u8],
+    ) -> Result<[u8; 32], KeystoreError> {
+        shelf_protocol::unwrap_epoch_key(wrap, &self.x25519, &self.ml_kem_dk, aad)
+            .map_err(|e| KeystoreError::Identity(e.to_string()))
+    }
+
+    /// Wrap a secret under the device wrap key.
+    pub fn wrap_secret(&self, secret: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+        aead_wrap(&self.wrap_key, b"shelf/keystore/v1", secret)
     }
 }
 
@@ -248,6 +266,9 @@ impl DeviceKeystore {
         DeviceSigner {
             device_id: self.identity.device_id,
             signing: self.signing.clone(),
+            x25519: self.x25519.clone(),
+            ml_kem_dk: self.ml_kem_dk.clone(),
+            wrap_key: self.wrap_key,
         }
     }
 

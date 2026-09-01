@@ -6,16 +6,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::store::MemoryStore;
-use shelf_core::{DeviceId, ObjectId, SigningPublicKey, Timestamp};
 #[cfg(test)]
 use shelf_core::VaultId;
+use shelf_core::{DeviceId, ObjectId, SigningPublicKey, Timestamp};
 use shelf_keystore::{DeviceSigner, verify_signature};
 use shelf_protocol::EncryptedObject;
 use shelf_store::SqliteStore;
 use shelf_transport::{
-    LanTransport, MailboxClient, OpBody, ReplicaFrame, SessionHello, SignedOperation, accept_tls,
-    connect_tls, hello_transcript, new_op_id, parse_home_config, parse_sig_hex, read_bounded_line,
-    sig_hex, tailscale_status, tls_exporter_client, tls_exporter_server, write_bounded_line,
+    LanTransport, MailboxClient, OpBody, OriginCursor, PeerMessage, ReplicaFrame, SessionHello,
+    SignedOperation, accept_tls, connect_tls, hello_transcript, new_op_id, parse_home_config,
+    parse_sig_hex, read_bounded_line, sig_hex, tailscale_status, tls_exporter_client,
+    tls_exporter_server, write_bounded_line,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -54,6 +55,12 @@ async fn replica_loop(
             .mailbox_id()
             .unwrap_or_else(|_| hex_id(store.vault_id().as_bytes()))
     };
+    let mailbox_read_cap = {
+        let store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.mailbox_read_cap().unwrap_or_default()
+    };
 
     if let Ok(listener) = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], cfg.peer_port))).await {
         let store_in = Arc::clone(&store);
@@ -78,7 +85,7 @@ async fn replica_loop(
         )
         .await;
         if let Some(client) = &mailbox
-            && let Ok(items) = client.get(&mailbox_id).await
+            && let Ok(items) = client.get(&mailbox_id, &mailbox_read_cap).await
         {
             let mut replies = Vec::new();
             {
@@ -86,11 +93,17 @@ async fn replica_loop(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for item in &items {
-                    replies.extend(ingest_network_ciphertext(&mut store, &item.ciphertext));
+                    replies.extend(ingest_network_ciphertext(
+                        &mut store,
+                        Some(&signer),
+                        &item.ciphertext,
+                    ));
                 }
             }
             for item in items {
-                let _ = client.ack(&mailbox_id, &item.object_id).await;
+                let _ = client
+                    .ack(&mailbox_id, &mailbox_read_cap, &item.object_id)
+                    .await;
             }
             let reply_frames = {
                 let store = store
@@ -111,7 +124,31 @@ async fn replica_loop(
                 let Ok(line) = serde_json::to_vec(frame) else {
                     continue;
                 };
-                let _ = client.put(&mailbox_id, &frame.op_id, &line, 86_400).await;
+                let bindings = {
+                    let store = store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    store
+                        .membership_snapshot()
+                        .ok()
+                        .flatten()
+                        .map(|s| s.mailbox_bindings)
+                        .unwrap_or_default()
+                };
+                for bind in bindings {
+                    if bind.device_id == signer.device_id() {
+                        continue;
+                    }
+                    let _ = client
+                        .put(
+                            &bind.mailbox_id,
+                            &bind.write_cap,
+                            &frame.op_id,
+                            &line,
+                            86_400,
+                        )
+                        .await;
+                }
             }
         }
     }
@@ -161,13 +198,52 @@ async fn accept_peer_sessions(
             }
             while let Ok(Some(buf)) = read_bounded_line(&mut tls).await {
                 let slice = buf.strip_suffix(b"\n").unwrap_or(&buf);
-                let replies = if let Ok(frame) = serde_json::from_slice::<ReplicaFrame>(slice) {
+                if let Ok(PeerMessage::Have { cursors }) =
+                    serde_json::from_slice::<PeerMessage>(slice)
+                {
+                    let (have, missing) = {
+                        let store = store
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let ours = store
+                            .op_cursors()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(origin, seq)| OriginCursor { origin, seq })
+                            .collect::<Vec<_>>();
+                        let want: Vec<(DeviceId, u64)> =
+                            cursors.iter().map(|c| (c.origin, c.seq)).collect();
+                        let missing = store.export_ops_after(&want).unwrap_or_default();
+                        (ours, missing)
+                    };
+                    let have_line = serde_json::to_vec(&PeerMessage::Have { cursors: have }).ok();
+                    if let Some(line) = have_line {
+                        let _ = write_bounded_line(&mut tls, &line).await;
+                    }
+                    for json in missing {
+                        if let Ok(op) = serde_json::from_str::<SignedOperation>(&json)
+                            && let Ok(line) =
+                                serde_json::to_vec(&PeerMessage::Op { op: Box::new(op) })
+                        {
+                            let _ = write_bounded_line(&mut tls, &line).await;
+                        }
+                    }
+                    continue;
+                }
+                let frame = if let Ok(PeerMessage::Op { op }) =
+                    serde_json::from_slice::<PeerMessage>(slice)
+                {
+                    *op
+                } else if let Ok(frame) = serde_json::from_slice::<ReplicaFrame>(slice) {
+                    frame
+                } else {
+                    continue;
+                };
+                let replies = {
                     let mut store = store
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    apply_frame(&mut store, frame)
-                } else {
-                    Vec::new()
+                    apply_frame(&mut store, Some(&signer), frame)
                 };
                 for (parent, envelope) in replies {
                     let line = {
@@ -178,7 +254,10 @@ async fn accept_peer_sessions(
                         let mut frame =
                             mint_op(&store, &signer, seq, OpBody::Chunk { parent, envelope });
                         sign_frame(&mut frame, &signer);
-                        serde_json::to_vec(&frame).ok()
+                        serde_json::to_vec(&PeerMessage::Op {
+                            op: Box::new(frame),
+                        })
+                        .ok()
                     };
                     if let Some(line) = line {
                         let _ = write_bounded_line(&mut tls, &line).await;
@@ -194,7 +273,6 @@ fn local_hello(store: &SqliteStore, signer: &DeviceSigner, exporter: &[u8; 32]) 
     SessionHello {
         vault_id: store.vault_id(),
         device_id: signer.device_id(),
-        exporter: exporter.iter().map(|b| format!("{b:02x}")).collect(),
         signature: sig_hex(&signer.sign(&transcript)),
     }
 }
@@ -217,21 +295,16 @@ async fn push_now(
     store: &Arc<Mutex<SqliteStore>>,
     signer: &DeviceSigner,
     mailbox: Option<&MailboxClient>,
-    mailbox_id: &str,
+    _mailbox_id: &str,
     lan: Option<&LanTransport>,
     peer_port: u16,
 ) -> Result<(), std::io::Error> {
-    let frames = {
+    let (need_frames, our_cursors, bindings) = {
         let store = store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_op_log(&store, signer);
-        let mut frames: Vec<SignedOperation> = store
-            .export_ops_json()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|json| serde_json::from_str(&json).ok())
-            .collect();
+        let mut need_frames = Vec::new();
         let objects = store.export_objects().unwrap_or_default();
         for rec in objects {
             if let Ok(missing) = store.missing_chunks(rec.envelope.object_id)
@@ -248,31 +321,103 @@ async fn push_now(
                     },
                 );
                 sign_frame(&mut frame, signer);
-                frames.push(frame);
+                need_frames.push(frame);
             }
         }
-        frames
+        let our_cursors = store
+            .op_cursors()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(origin, seq)| OriginCursor { origin, seq })
+            .collect::<Vec<_>>();
+        let bindings = store
+            .membership_snapshot()
+            .ok()
+            .flatten()
+            .map(|s| s.mailbox_bindings)
+            .unwrap_or_default();
+        (need_frames, our_cursors, bindings)
     };
 
     if let Some(lan) = lan {
         let _ = lan.announce().await;
     }
-    let addrs = tailscale_peer_addrs(peer_port);
-    for frame in &frames {
-        let Ok(line) = serde_json::to_vec(frame) else {
-            continue;
+
+    if let Some(client) = mailbox {
+        let ops = {
+            let store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.export_ops_json().unwrap_or_default()
         };
-        if let Some(client) = mailbox {
-            let _ = client.put(mailbox_id, &frame.op_id, &line, 86_400).await;
+        for json in &ops {
+            let Ok(frame) = serde_json::from_str::<SignedOperation>(json) else {
+                continue;
+            };
+            let Ok(line) = serde_json::to_vec(&frame) else {
+                continue;
+            };
+            for bind in &bindings {
+                if bind.device_id == signer.device_id() {
+                    continue;
+                }
+                let _ = client
+                    .put(
+                        &bind.mailbox_id,
+                        &bind.write_cap,
+                        &frame.op_id,
+                        &line,
+                        86_400,
+                    )
+                    .await;
+            }
         }
-        for addr in &addrs {
-            let _ = send_signed_session(*addr, signer, store, &line).await;
+        for frame in &need_frames {
+            let Ok(line) = serde_json::to_vec(frame) else {
+                continue;
+            };
+            for bind in &bindings {
+                if bind.device_id == signer.device_id() {
+                    continue;
+                }
+                let _ = client
+                    .put(
+                        &bind.mailbox_id,
+                        &bind.write_cap,
+                        &frame.op_id,
+                        &line,
+                        86_400,
+                    )
+                    .await;
+            }
         }
+    }
+
+    let addrs = tailscale_peer_addrs(peer_port);
+    for addr in addrs {
+        let _ = send_session_batch(addr, signer, store, &our_cursors, &need_frames).await;
     }
     Ok(())
 }
 
 fn ensure_op_log(store: &SqliteStore, signer: &DeviceSigner) {
+    if let Ok(Some(bytes)) = store.take_pending_epoch_transition()
+        && let Ok(payload) =
+            serde_json::from_slice::<shelf_protocol::EpochTransitionPayload>(&bytes)
+    {
+        record_op(
+            store,
+            signer,
+            &format!("epoch:{}", payload.new_epoch.as_u64()),
+            OpBody::EpochTransition {
+                old_epoch: payload.old_epoch,
+                new_epoch: payload.new_epoch,
+                revoked: payload.revoked,
+                snapshot: payload.snapshot,
+                envelopes: payload.envelopes,
+            },
+        );
+    }
     let objects = store.export_objects().unwrap_or_default();
     let tombstones = store.export_tombstones().unwrap_or_default();
     let scratch = store.export_scratch().unwrap_or_default();
@@ -310,7 +455,10 @@ fn ensure_op_log(store: &SqliteStore, signer: &DeviceSigner) {
         record_op(
             store,
             signer,
-            &format!("scratch:{}", envelope.object_id),
+            &format!(
+                "scratch:{}:{}",
+                envelope.object_id, envelope.ciphertext_hash
+            ),
             OpBody::Scratch { envelope },
         );
     }
@@ -332,7 +480,7 @@ fn record_op(store: &SqliteStore, signer: &DeviceSigner, dedupe: &str, body: OpB
     let mut frame = mint_op(store, signer, seq, body);
     sign_frame(&mut frame, signer);
     if let Ok(json) = serde_json::to_string(&frame) {
-        let _ = store.append_op_json(dedupe, &json);
+        let _ = store.persist_signed_op(frame.origin, frame.seq, &frame.op_id, Some(dedupe), &json);
     }
 }
 
@@ -348,11 +496,12 @@ fn mint_op(store: &SqliteStore, signer: &DeviceSigner, seq: u64, body: OpBody) -
     }
 }
 
-async fn send_signed_session(
+async fn send_session_batch(
     addr: SocketAddr,
     signer: &DeviceSigner,
     store: &Arc<Mutex<SqliteStore>>,
-    line: &[u8],
+    our_cursors: &[OriginCursor],
+    need_frames: &[SignedOperation],
 ) -> Result<(), std::io::Error> {
     let connect = tokio::net::TcpStream::connect(addr);
     let stream = tokio::time::timeout(Duration::from_secs(2), connect)
@@ -384,7 +533,54 @@ async fn send_signed_session(
             return Err(std::io::Error::other("peer handshake rejected"));
         }
     }
-    write_bounded_line(&mut tls, line).await
+    let have = PeerMessage::Have {
+        cursors: our_cursors.to_vec(),
+    };
+    let have_line = serde_json::to_vec(&have).map_err(std::io::Error::other)?;
+    write_bounded_line(&mut tls, &have_line).await?;
+    let Some(peer_have_bytes) = read_bounded_line(&mut tls).await? else {
+        return Ok(());
+    };
+    let peer_have: PeerMessage = serde_json::from_slice(
+        peer_have_bytes
+            .strip_suffix(b"\n")
+            .unwrap_or(&peer_have_bytes),
+    )
+    .map_err(std::io::Error::other)?;
+    let peer_cursors = match peer_have {
+        PeerMessage::Have { cursors } => cursors
+            .into_iter()
+            .map(|c| (c.origin, c.seq))
+            .collect::<Vec<_>>(),
+        PeerMessage::Op { op } => {
+            let mut store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = apply_frame(&mut store, Some(signer), *op);
+            Vec::new()
+        }
+    };
+    let missing = {
+        let store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.export_ops_after(&peer_cursors).unwrap_or_default()
+    };
+    for json in missing {
+        if let Ok(op) = serde_json::from_str::<SignedOperation>(&json) {
+            let line = serde_json::to_vec(&PeerMessage::Op { op: Box::new(op) })
+                .map_err(std::io::Error::other)?;
+            write_bounded_line(&mut tls, &line).await?;
+        }
+    }
+    for frame in need_frames {
+        let line = serde_json::to_vec(&PeerMessage::Op {
+            op: Box::new(frame.clone()),
+        })
+        .map_err(std::io::Error::other)?;
+        write_bounded_line(&mut tls, &line).await?;
+    }
+    Ok(())
 }
 
 fn tailscale_peer_addrs(peer_port: u16) -> Vec<SocketAddr> {
@@ -403,18 +599,38 @@ fn tailscale_peer_addrs(peer_port: u16) -> Vec<SocketAddr> {
 }
 
 fn sign_frame(frame: &mut ReplicaFrame, signer: &DeviceSigner) {
-    let Ok(body) = frame.unsigned_bytes() else {
-        return;
-    };
+    let body = frame.unsigned_bytes();
     frame.set_signature(sig_hex(&signer.sign(&body)));
 }
 
-fn apply_frame(store: &mut SqliteStore, frame: ReplicaFrame) -> Vec<(ObjectId, EncryptedObject)> {
+fn apply_frame(
+    store: &mut SqliteStore,
+    signer: Option<&DeviceSigner>,
+    frame: ReplicaFrame,
+) -> Vec<(ObjectId, EncryptedObject)> {
+    if frame.vault_id != store.vault_id() {
+        return Vec::new();
+    }
     if !frame_trusted(store, &frame) {
         return Vec::new();
     }
-    if frame.vault_id != store.vault_id() {
+    if matches!(frame.body, OpBody::EpochTransition { .. }) && !origin_is_root(store, &frame) {
         return Vec::new();
+    }
+    if matches!(frame.body, OpBody::EpochTransition { .. })
+        && !epoch_wrap_for_local(store, signer, &frame)
+    {
+        return Vec::new();
+    }
+    if let Some(dedupe) = frame.dedupe_key() {
+        let Ok(json) = serde_json::to_string(&frame) else {
+            return Vec::new();
+        };
+        match store.persist_signed_op(frame.origin, frame.seq, &frame.op_id, Some(&dedupe), &json) {
+            Ok(false) => return Vec::new(),
+            Ok(true) => {}
+            Err(_) => return Vec::new(),
+        }
     }
     match frame.body {
         OpBody::Put { envelope } => {
@@ -423,8 +639,9 @@ fn apply_frame(store: &mut SqliteStore, frame: ReplicaFrame) -> Vec<(ObjectId, E
                 .as_ref()
                 .and_then(|o| o.created)
                 .unwrap_or_else(shelf_core::HybridTimestamp::now);
+            let expires = meta.as_ref().and_then(|o| o.expires_at);
             let name = meta.and_then(|o| o.name);
-            let _ = store.ingest_envelope(envelope, created, false, None, name);
+            let _ = store.ingest_envelope(envelope, created, false, expires, name);
             Vec::new()
         }
         OpBody::Pin { object_id, .. } => {
@@ -446,20 +663,83 @@ fn apply_frame(store: &mut SqliteStore, frame: ReplicaFrame) -> Vec<(ObjectId, E
         OpBody::NeedChunks { parent, chunk_ids } => store
             .chunk_envelopes(parent, &chunk_ids)
             .unwrap_or_default(),
-        OpBody::Revoke { device_id, .. } => {
-            let _ = store.remove_member(device_id);
+        OpBody::EpochTransition {
+            old_epoch,
+            new_epoch,
+            revoked,
+            snapshot,
+            envelopes,
+        } => {
+            let Some(signer) = signer else {
+                return Vec::new();
+            };
+            let Some(mine) = envelopes.iter().find(|e| e.device_id == signer.device_id()) else {
+                return Vec::new();
+            };
+            let aad = shelf_protocol::epoch_transition_aad(
+                store.vault_id(),
+                old_epoch,
+                new_epoch,
+                revoked,
+            );
+            let Ok(raw) = signer.unwrap_epoch(&mine.wrap, &aad) else {
+                return Vec::new();
+            };
+            let Ok(wrapped) = signer.wrap_secret(&raw) else {
+                return Vec::new();
+            };
+            let key = shelf_protocol::EpochKey::from_bytes(raw);
+            let _ = store.add_epoch_key(new_epoch, key.clone());
+            let _ = store.adopt_membership(key, new_epoch, store.vault_id());
+            let _ = store.save_wrapped_epoch_key(&wrapped);
+            let _ = store.remove_member(revoked);
+            let _ = store.save_membership_snapshot(&snapshot);
             Vec::new()
         }
     }
+}
+
+fn origin_is_root(store: &SqliteStore, frame: &ReplicaFrame) -> bool {
+    let Ok(Some(root)) = store.vault_root() else {
+        return false;
+    };
+    let Some(pk) = member_pubkey(store, frame.origin()) else {
+        return false;
+    };
+    pk == root.root_signing_pubkey
+}
+
+fn epoch_wrap_for_local(
+    store: &SqliteStore,
+    signer: Option<&DeviceSigner>,
+    frame: &ReplicaFrame,
+) -> bool {
+    let OpBody::EpochTransition {
+        old_epoch,
+        new_epoch,
+        revoked,
+        envelopes,
+        ..
+    } = &frame.body
+    else {
+        return true;
+    };
+    let Some(signer) = signer else {
+        return false;
+    };
+    let Some(mine) = envelopes.iter().find(|e| e.device_id == signer.device_id()) else {
+        return false;
+    };
+    let aad =
+        shelf_protocol::epoch_transition_aad(store.vault_id(), *old_epoch, *new_epoch, *revoked);
+    signer.unwrap_epoch(&mine.wrap, &aad).is_ok()
 }
 
 fn frame_trusted(store: &SqliteStore, frame: &ReplicaFrame) -> bool {
     let Some(sig) = parse_sig_hex(frame.signature_hex()) else {
         return false;
     };
-    let Ok(body) = frame.unsigned_bytes() else {
-        return false;
-    };
+    let body = frame.unsigned_bytes();
     let origin = frame.origin();
     if origin == store.device_id() {
         return false;
@@ -472,7 +752,11 @@ fn frame_trusted(store: &SqliteStore, frame: &ReplicaFrame) -> bool {
 }
 
 fn member_pubkey(store: &SqliteStore, origin: DeviceId) -> Option<SigningPublicKey> {
-    let members = store.members().ok()?;
+    let members = store
+        .validated_members()
+        .ok()
+        .filter(|m| !m.is_empty())
+        .or_else(|| store.members().ok())?;
     members
         .into_iter()
         .find(|c| c.device_id == origin)
@@ -481,12 +765,13 @@ fn member_pubkey(store: &SqliteStore, origin: DeviceId) -> Option<SigningPublicK
 
 fn ingest_network_ciphertext(
     store: &mut SqliteStore,
+    signer: Option<&DeviceSigner>,
     ciphertext: &[u8],
 ) -> Vec<(ObjectId, EncryptedObject)> {
     let Ok(frame) = serde_json::from_slice::<ReplicaFrame>(ciphertext) else {
         return Vec::new();
     };
-    apply_frame(store, frame)
+    apply_frame(store, signer, frame)
 }
 
 fn hex_id(bytes: &[u8; 32]) -> String {
@@ -501,7 +786,7 @@ pub fn signed_pin_frame(
     object_id: ObjectId,
 ) -> ReplicaFrame {
     let mut frame = SignedOperation {
-        seq: 1,
+        seq: 2,
         op_id: new_op_id(),
         vault_id,
         epoch: shelf_core::EpochId::new(1),
@@ -524,7 +809,7 @@ pub fn signed_tombstone_frame(
     object_id: ObjectId,
 ) -> ReplicaFrame {
     let mut frame = SignedOperation {
-        seq: 1,
+        seq: 3,
         op_id: new_op_id(),
         vault_id,
         epoch: shelf_core::EpochId::new(1),
@@ -618,15 +903,15 @@ mod tests {
             },
         );
         sign_frame(&mut obj, &sa);
-        apply_frame(&mut b, obj);
+        apply_frame(&mut b, Some(&sb), obj);
         assert_eq!(b.get(&ItemTarget::Id(id)).unwrap().bytes, b"sync-me");
 
         let pin = signed_pin_frame(&sa, vault, id);
-        apply_frame(&mut b, pin);
+        apply_frame(&mut b, Some(&sb), pin);
         assert!(b.ls().unwrap()[0].pinned);
 
         let tomb = signed_tombstone_frame(&sa, vault, id);
-        apply_frame(&mut b, tomb);
+        apply_frame(&mut b, Some(&sb), tomb);
         assert!(b.is_tombstoned(id).unwrap());
         let _ = created;
     }
@@ -676,9 +961,10 @@ mod tests {
             },
         );
         sign_frame(&mut obj, &sa);
-        apply_frame(&mut b, obj);
+        apply_frame(&mut b, Some(&sb), obj);
         apply_frame(
             &mut b,
+            Some(&sb),
             SignedOperation {
                 seq: 2,
                 op_id: new_op_id(),
@@ -730,7 +1016,7 @@ mod tests {
         let (id, _) = a.put(b"secret".to_vec(), ContentKind::Text, None).unwrap();
         let rec = a.export_objects().unwrap().into_iter().next().unwrap();
         let blob = serde_json::to_vec(&rec).unwrap();
-        ingest_network_ciphertext(&mut b, &blob);
+        ingest_network_ciphertext(&mut b, None, &blob);
         assert!(b.get(&ItemTarget::Id(id)).is_err());
     }
 
@@ -770,7 +1056,7 @@ mod tests {
         let envelope = a.scratch_envelope("Scratch").unwrap().unwrap();
         let mut frame = mint_op(&a, &sa, 1, OpBody::Scratch { envelope });
         sign_frame(&mut frame, &sa);
-        apply_frame(&mut b, frame);
+        apply_frame(&mut b, Some(&sb), frame);
         assert_eq!(b.scratch_text("Scratch").unwrap(), "hello ");
     }
 
@@ -826,7 +1112,7 @@ mod tests {
             },
         );
         sign_frame(&mut put, &sa);
-        apply_frame(&mut b, put);
+        apply_frame(&mut b, Some(&sb), put);
         let missing = b.missing_chunks(id).unwrap();
         assert!(!missing.is_empty());
         let mut need = mint_op(
@@ -839,14 +1125,167 @@ mod tests {
             },
         );
         sign_frame(&mut need, &sb);
-        let replies = apply_frame(&mut a, need);
+        let replies = apply_frame(&mut a, Some(&sa), need);
         assert!(!replies.is_empty());
         for (parent, envelope) in replies {
             let mut chunk = mint_op(&a, &sa, 2, OpBody::Chunk { parent, envelope });
             sign_frame(&mut chunk, &sa);
-            apply_frame(&mut b, chunk);
+            apply_frame(&mut b, Some(&sb), chunk);
         }
         assert!(b.missing_chunks(id).unwrap().is_empty());
         assert_eq!(b.get(&ItemTarget::Id(id)).unwrap().bytes, payload);
+    }
+
+    #[test]
+    fn subsequent_scratch_edits_replicate() {
+        use shelf_protocol::EpochKey;
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let ka = DeviceKeystore::open_or_init(dir_a.path(), Some("a"), None, true).unwrap();
+        let kb = DeviceKeystore::open_or_init(dir_b.path(), Some("b"), None, true).unwrap();
+        let sa = ka.device_signer();
+        let sb = kb.device_signer();
+        let key_bytes = *EpochKey::new().as_bytes();
+        let vault = VaultId::new();
+        let epoch = EpochId::new(1);
+        let mut a = SqliteStore::open(
+            &dir_a.path().join("state.db"),
+            EpochKey::from_bytes(key_bytes),
+            sa.device_id(),
+            epoch,
+            vault,
+            &[0xEE; 32],
+        )
+        .unwrap();
+        let mut b = SqliteStore::open(
+            &dir_b.path().join("state.db"),
+            EpochKey::from_bytes(key_bytes),
+            sb.device_id(),
+            epoch,
+            vault,
+            &[0xEE; 32],
+        )
+        .unwrap();
+        a.put_member(&member_cert(vault, &sa, 1)).unwrap();
+        b.put_member(&member_cert(vault, &sa, 1)).unwrap();
+        a.scratch_append("Scratch", "hello ").unwrap();
+        let env1 = a.scratch_envelope("Scratch").unwrap().unwrap();
+        let mut f1 = mint_op(&a, &sa, 1, OpBody::Scratch { envelope: env1 });
+        sign_frame(&mut f1, &sa);
+        apply_frame(&mut b, Some(&sb), f1);
+        a.scratch_append("Scratch", "world").unwrap();
+        let env2 = a.scratch_envelope("Scratch").unwrap().unwrap();
+        let mut f2 = mint_op(&a, &sa, 2, OpBody::Scratch { envelope: env2 });
+        sign_frame(&mut f2, &sa);
+        apply_frame(&mut b, Some(&sb), f2);
+        assert_eq!(b.scratch_text("Scratch").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn inbound_put_preserves_authenticated_expiry() {
+        use shelf_protocol::EpochKey;
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let ka = DeviceKeystore::open_or_init(dir_a.path(), Some("a"), None, true).unwrap();
+        let kb = DeviceKeystore::open_or_init(dir_b.path(), Some("b"), None, true).unwrap();
+        let sa = ka.device_signer();
+        let sb = kb.device_signer();
+        let key_bytes = *EpochKey::new().as_bytes();
+        let vault = VaultId::new();
+        let epoch = EpochId::new(1);
+        let mut a = SqliteStore::open(
+            &dir_a.path().join("state.db"),
+            EpochKey::from_bytes(key_bytes),
+            sa.device_id(),
+            epoch,
+            vault,
+            &[0xEE; 32],
+        )
+        .unwrap();
+        let mut b = SqliteStore::open(
+            &dir_b.path().join("state.db"),
+            EpochKey::from_bytes(key_bytes),
+            sb.device_id(),
+            epoch,
+            vault,
+            &[0xEE; 32],
+        )
+        .unwrap();
+        a.put_member(&member_cert(vault, &sa, 1)).unwrap();
+        b.put_member(&member_cert(vault, &sa, 1)).unwrap();
+        let (_id, _) = a.put(b"ttl".to_vec(), ContentKind::Text, None).unwrap();
+        let rec = a.export_objects().unwrap().into_iter().next().unwrap();
+        assert!(rec.expires_at.is_some());
+        let mut obj = mint_op(
+            &a,
+            &sa,
+            1,
+            OpBody::Put {
+                envelope: rec.envelope,
+            },
+        );
+        sign_frame(&mut obj, &sa);
+        apply_frame(&mut b, Some(&sb), obj);
+        assert!(b.ls().unwrap()[0].expires_at.is_some());
+    }
+
+    #[test]
+    fn duplicate_op_id_is_ignored_and_seq_conflict_rejected() {
+        use shelf_protocol::EpochKey;
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let ka = DeviceKeystore::open_or_init(dir_a.path(), Some("a"), None, true).unwrap();
+        let kb = DeviceKeystore::open_or_init(dir_b.path(), Some("b"), None, true).unwrap();
+        let sa = ka.device_signer();
+        let sb = kb.device_signer();
+        let key_bytes = *EpochKey::new().as_bytes();
+        let vault = VaultId::new();
+        let epoch = EpochId::new(1);
+        let mut a = SqliteStore::open(
+            &dir_a.path().join("state.db"),
+            EpochKey::from_bytes(key_bytes),
+            sa.device_id(),
+            epoch,
+            vault,
+            &[0xEE; 32],
+        )
+        .unwrap();
+        let mut b = SqliteStore::open(
+            &dir_b.path().join("state.db"),
+            EpochKey::from_bytes(key_bytes),
+            sb.device_id(),
+            epoch,
+            vault,
+            &[0xEE; 32],
+        )
+        .unwrap();
+        a.put_member(&member_cert(vault, &sa, 1)).unwrap();
+        b.put_member(&member_cert(vault, &sa, 1)).unwrap();
+        let (id, _) = a.put(b"once".to_vec(), ContentKind::Text, None).unwrap();
+        let rec = a.export_objects().unwrap().into_iter().next().unwrap();
+        let mut obj = mint_op(
+            &a,
+            &sa,
+            1,
+            OpBody::Put {
+                envelope: rec.envelope,
+            },
+        );
+        sign_frame(&mut obj, &sa);
+        apply_frame(&mut b, Some(&sb), obj.clone());
+        apply_frame(&mut b, Some(&sb), obj.clone());
+        assert_eq!(b.get(&ItemTarget::Id(id)).unwrap().bytes, b"once");
+        let mut pin = mint_op(
+            &a,
+            &sa,
+            1,
+            OpBody::Pin {
+                object_id: id,
+                at: Timestamp::now(),
+            },
+        );
+        sign_frame(&mut pin, &sa);
+        apply_frame(&mut b, Some(&sb), pin);
+        assert!(!b.ls().unwrap()[0].pinned);
     }
 }

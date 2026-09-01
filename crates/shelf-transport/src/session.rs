@@ -22,9 +22,9 @@ pub struct SessionHello {
     pub vault_id: VaultId,
     /// Speaker device id (must match a membership certificate).
     pub device_id: DeviceId,
-    /// TLS exporter (hex) bound into the signature.
-    pub exporter: String,
     /// Hex Ed25519 signature over `vault_id || device_id || exporter`.
+    ///
+    /// The exporter is taken from the live TLS connection, never from the wire.
     pub signature: String,
 }
 
