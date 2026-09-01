@@ -21,6 +21,7 @@ fn help_lists_core_commands() {
     );
     for cmd in [
         "put", "latest", "ls", "get", "pin", "rm", "init", "enroll", "scratch", "capture",
+        "recovery",
     ] {
         assert!(
             text.contains(cmd),
@@ -282,6 +283,104 @@ mod ipc {
         let _ = server.await;
         let _ = std::fs::remove_file(&sock);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_export_apply_latest_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let vault = shelf_keystore::open_or_create_vault(home.path(), Some("root"), None, true)
+            .expect("open vault");
+        let base = 30_000 + (std::process::id() % 10_000) as u16;
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "lan_port = {base}\npeer_port = {}\n",
+                base.saturating_add(1)
+            ),
+        )
+        .unwrap();
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve_with_replica(
+            sock.clone(),
+            vault.store,
+            home.path().to_path_buf(),
+            vault.keys,
+        ));
+        wait_for_socket(&sock).await;
+
+        let put = run_with_stdin(&sock, &["put"], b"hello-recovery");
+        assert_success(&put);
+
+        let pass = format!("rec-{}", std::process::id());
+        let bundle = home.path().join("vault.shelfrecovery");
+        let export = Command::new(bin())
+            .args([
+                "--home",
+                home.path().to_str().unwrap(),
+                "--socket",
+                sock.to_str().unwrap(),
+                "recovery",
+                "export",
+                "--out",
+                bundle.to_str().unwrap(),
+            ])
+            .env("SHELF_RECOVERY_PASSPHRASE", &pass)
+            .output()
+            .unwrap();
+        assert_success(&export);
+        assert!(bundle.exists(), "expected {}", bundle.display());
+        let bundle_text = std::fs::read_to_string(&bundle).unwrap();
+        assert!(!bundle_text.contains(&pass));
+        assert!(!bundle_text.contains("hello-recovery"));
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+
+        let restored = tempfile::tempdir().unwrap();
+        let apply = Command::new(bin())
+            .args([
+                "--home",
+                restored.path().to_str().unwrap(),
+                "recovery",
+                "apply",
+                "--from",
+                bundle.to_str().unwrap(),
+                "--allow-file-key",
+            ])
+            .env("SHELF_RECOVERY_PASSPHRASE", &pass)
+            .output()
+            .unwrap();
+        assert!(apply.status.success(), "{}", stderr_str(&apply));
+
+        let vault2 = shelf_keystore::open_or_create_vault(restored.path(), None, None, true)
+            .expect("open restored");
+        let base2 = base.saturating_add(2);
+        std::fs::write(
+            restored.path().join("config.toml"),
+            format!(
+                "lan_port = {base2}\npeer_port = {}\n",
+                base2.saturating_add(1)
+            ),
+        )
+        .unwrap();
+        let sock2 = temp_socket_path();
+        let _ = std::fs::remove_file(&sock2);
+        let server2 = tokio::spawn(serve_with_replica(
+            sock2.clone(),
+            vault2.store,
+            restored.path().to_path_buf(),
+            vault2.keys,
+        ));
+        wait_for_socket(&sock2).await;
+        let latest = run(&sock2, &["latest"]);
+        assert_success(&latest);
+        assert_eq!(latest.stdout, b"hello-recovery");
+
+        server2.abort();
+        let _ = server2.await;
+        let _ = std::fs::remove_file(&sock2);
+    }
 }
 
 fn stderr_str(output: &Output) -> String {
@@ -375,4 +474,61 @@ fn init_export_approve_import_two_homes() {
     assert!(grant.exists());
     assert!(member.path().join("config.toml").exists());
     assert!(member.path().join("state.db").exists());
+}
+
+#[test]
+fn recovery_wrong_passphrase_fails_typed() {
+    let home = tempfile::tempdir().unwrap();
+    let init = Command::new(bin())
+        .args([
+            "--home",
+            home.path().to_str().unwrap(),
+            "init",
+            "--name",
+            "root",
+            "--allow-file-key",
+        ])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{}", stderr_str(&init));
+
+    let pass = format!("rec-ok-{}", std::process::id());
+    let bundle = home.path().join("vault.shelfrecovery");
+    let export = Command::new(bin())
+        .args([
+            "--home",
+            home.path().to_str().unwrap(),
+            "recovery",
+            "export",
+            "--out",
+            bundle.to_str().unwrap(),
+        ])
+        .env("SHELF_RECOVERY_PASSPHRASE", &pass)
+        .output()
+        .unwrap();
+    assert!(export.status.success(), "{}", stderr_str(&export));
+
+    let restored = tempfile::tempdir().unwrap();
+    let wrong = format!("rec-bad-{}", std::process::id());
+    let apply = Command::new(bin())
+        .args([
+            "--home",
+            restored.path().to_str().unwrap(),
+            "recovery",
+            "apply",
+            "--from",
+            bundle.to_str().unwrap(),
+            "--allow-file-key",
+        ])
+        .env("SHELF_RECOVERY_PASSPHRASE", &wrong)
+        .output()
+        .unwrap();
+    assert!(!apply.status.success());
+    let err = stderr_str(&apply);
+    assert!(
+        err.contains("wrong passphrase") || err.contains("recovery bundle"),
+        "typed recovery failure, got {err:?}"
+    );
+    assert!(!err.contains(&pass));
+    assert!(!err.contains(&wrong));
 }

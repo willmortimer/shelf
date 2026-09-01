@@ -95,6 +95,19 @@ pub enum IpcRequest {
         /// Caller-confirmed two-way SAS.
         expect_sas: String,
     },
+    /// Export a passphrase-wrapped `.shelfrecovery` from the daemon vault.
+    RecoveryExport {
+        /// Recovery-bundle passphrase. Never log this field.
+        passphrase: String,
+    },
+    /// Apply a recovery bundle. The CLI never sends this: apply is local
+    /// against an empty `--home`. The daemon rejects it.
+    RecoveryApply {
+        /// Parsed `.shelfrecovery` JSON.
+        bundle: serde_json::Value,
+        /// Recovery-bundle passphrase. Never log this field.
+        passphrase: String,
+    },
 }
 
 fn default_scratch_name() -> String {
@@ -134,6 +147,8 @@ impl fmt::Debug for IpcRequest {
             Self::EnrollExport => write!(f, "EnrollExport"),
             Self::EnrollApprove { .. } => write!(f, "EnrollApprove"),
             Self::EnrollImport { .. } => write!(f, "EnrollImport"),
+            Self::RecoveryExport { .. } => write!(f, "RecoveryExport"),
+            Self::RecoveryApply { .. } => write!(f, "RecoveryApply"),
         }
     }
 }
@@ -226,6 +241,13 @@ pub enum IpcResponse {
     },
     /// Successful enroll import.
     EnrollImport,
+    /// Successful recovery export.
+    RecoveryExport {
+        /// `.shelfrecovery` JSON to write on the client.
+        bundle: serde_json::Value,
+    },
+    /// Successful recovery apply (unused: apply is CLI-direct).
+    RecoveryApply,
     /// Typed failure.
     Error {
         /// Stable error class.
@@ -270,6 +292,8 @@ impl fmt::Debug for IpcResponse {
                 f.debug_struct("EnrollApprove").field("sas", sas).finish()
             }
             Self::EnrollImport => write!(f, "EnrollImport"),
+            Self::RecoveryExport { .. } => write!(f, "RecoveryExport"),
+            Self::RecoveryApply => write!(f, "RecoveryApply"),
             Self::Error { code, message } => f
                 .debug_struct("Error")
                 .field("code", code)
@@ -366,6 +390,13 @@ mod tests {
             serde_json::to_string(&IpcRequest::EnrollExport).unwrap(),
             r#"{"op":"enroll_export"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&IpcRequest::RecoveryExport {
+                passphrase: "secret".into(),
+            })
+            .unwrap(),
+            r#"{"op":"recovery_export","passphrase":"secret"}"#
+        );
     }
 
     #[test]
@@ -444,5 +475,17 @@ mod tests {
         let debug = format!("{req:?}");
         assert!(!debug.contains("secret-payload"));
         assert!(debug.contains("bytes_len"));
+
+        let rec = IpcRequest::RecoveryExport {
+            passphrase: "bundle-passphrase".into(),
+        };
+        let rec_debug = format!("{rec:?}");
+        assert!(!rec_debug.contains("bundle-passphrase"));
+        assert_eq!(rec_debug, "RecoveryExport");
+        let apply = IpcRequest::RecoveryApply {
+            bundle: serde_json::json!({}),
+            passphrase: "bundle-passphrase".into(),
+        };
+        assert!(!format!("{apply:?}").contains("bundle-passphrase"));
     }
 }

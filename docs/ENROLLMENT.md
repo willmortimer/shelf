@@ -327,9 +327,16 @@ The removed device retains whatever old data it previously possessed but cannot 
 
 A mailbox cannot recover a lost vault because it has no keys.
 
-Therefore users should be able to create an explicit recovery artifact protected by a strong passphrase and/or external Kage-managed key.
+Users create an explicit recovery artifact with a strong passphrase:
 
-Recovery is a separate trust path and should never silently weaken normal device enrollment.
+```bash
+shelf recovery export --out vault.shelfrecovery
+shelf recovery apply --from vault.shelfrecovery --allow-file-key
+```
+
+The bundle (`shelf/recovery/v1`) wraps the vault root identity, current epoch key, membership snapshot, and sealed objects. Apply restores that `VaultRoot` onto an empty `--home` so the recovered device can decrypt and issue v1 root-only grants. The bundle passphrase is a hidden TTY prompt or `SHELF_RECOVERY_PASSPHRASE` (never argv, never logged). Export can go through `shelfd` when it is up; apply is always CLI-direct against `--home`.
+
+Recovery is a separate trust path and should never silently weaken normal device enrollment. Kage-managed recovery keys are out of scope for this version.
 
 ## Config/state placement
 

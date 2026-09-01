@@ -20,6 +20,8 @@ pub const DOMAIN_ENROLLMENT: &str = "shelf/enrollment/v1";
 pub const DOMAIN_MEMBERSHIP: &str = "shelf/membership/v1";
 /// Domain label for search-index keys.
 pub const DOMAIN_SEARCH: &str = "shelf/search/v1";
+/// Domain / AEAD AAD for passphrase-wrapped recovery bundles.
+pub const DOMAIN_RECOVERY: &str = "shelf/recovery/v1";
 
 /// Preferred AEAD: XChaCha20-Poly1305.
 pub const PREFERRED_AEAD: AeadAlgorithm = AeadAlgorithm::XChaCha20Poly1305;
@@ -32,7 +34,7 @@ pub type PreferredMlKem = ml_kem::MlKem768;
 
 /// All domain-separation labels in a stable order.
 #[must_use]
-pub const fn all_domain_labels() -> [&'static str; 6] {
+pub const fn all_domain_labels() -> [&'static str; 7] {
     [
         DOMAIN_OBJECT,
         DOMAIN_CHUNK,
@@ -40,6 +42,7 @@ pub const fn all_domain_labels() -> [&'static str; 6] {
         DOMAIN_ENROLLMENT,
         DOMAIN_MEMBERSHIP,
         DOMAIN_SEARCH,
+        DOMAIN_RECOVERY,
     ]
 }
 
@@ -184,10 +187,11 @@ mod tests {
                 "shelf/enrollment/v1",
                 "shelf/membership/v1",
                 "shelf/search/v1",
+                "shelf/recovery/v1",
             ]
         );
         let unique: BTreeSet<_> = labels.into_iter().collect();
-        assert_eq!(unique.len(), 6);
+        assert_eq!(unique.len(), 7);
     }
 
     #[test]
