@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shelf-core",
+    "crates/shelf-store",
+    "crates/shelf-transport",
+    "crates/shelf-keystore",
+    "crates/shelf-protocol",
+    "crates/shelf-client",
+    "apps/shelfd",
+    "apps/shelf-cli",
+    "apps/shelf-desktop",
+    "services/shelf-mailbox",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+argon2 = "0.6.0"
+blake3 = "1.8.7"
+chacha20poly1305 = "0.11.0"
+clap = { version = "4.6.6", features = ["derive"] }
+ed25519-dalek = "3.0.0"
+hkdf = "0.13.0"
+ml-kem = "0.3.2"
+rand = "0.10.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+slint = "1.17.1"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.44"
+x25519-dalek = "3.0.0"
+yrs = "0.27.4"
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+shelf-core = { path = "crates/shelf-core" }
+shelf-store = { path = "crates/shelf-store" }
+shelf-transport = { path = "crates/shelf-transport" }
+shelf-keystore = { path = "crates/shelf-keystore" }
+shelf-protocol = { path = "crates/shelf-protocol" }
+shelf-client = { path = "crates/shelf-client" }

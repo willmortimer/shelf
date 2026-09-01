@@ -1,0 +1,329 @@
+# Shelf Enrollment
+
+## Principle
+
+Enrollment is independent of the mailbox and independent of any specific transport.
+
+The mailbox must never be required to establish trust.
+
+Shelf separates:
+
+```text
+Identity       Who is this cryptographic device?
+Membership     Is this device part of my Shelf vault?
+Connectivity   How can two devices exchange enrollment bytes?
+```
+
+## Device initialization
+
+On first launch:
+
+```bash
+shelf init
+```
+
+or the equivalent GUI action generates a new device identity locally.
+
+Conceptual state:
+
+```text
+DeviceIdentity
+├── DeviceId
+├── signing public key
+├── X25519 public key
+├── ML-KEM-768 public key
+├── private material protected by platform keystore
+└── optional transport hints
+```
+
+Private key material never leaves the device during normal enrollment.
+
+## Enrollment request
+
+The joining device creates an `EnrollmentRequest`.
+
+```rust
+struct EnrollmentRequest {
+    protocol_version: u16,
+    device_id: DeviceId,
+    device_name: String,
+    signing_pubkey: SigningPublicKey,
+    kem_pubkey: HybridKemPublicKey,
+    ephemeral_pubkey: EphemeralPublicKey,
+    transport_hints: Vec<TransportHint>,
+    capabilities: DeviceCapabilities,
+    nonce: [u8; 32],
+    expires_at: Timestamp,
+    self_signature: Signature,
+}
+```
+
+The request is not secret. It is a signed request analogous to a CSR.
+
+It may travel through:
+
+- Tailscale,
+- LAN,
+- QR code,
+- `.shelfjoin` file,
+- USB drive,
+- AirDrop or equivalent,
+- copy/paste,
+- another messaging channel.
+
+Security does not depend on the confidentiality of the request.
+
+## Human-verifiable fingerprint
+
+Both devices derive a short authentication string from the enrollment transcript, e.g. six human-readable words.
+
+```text
+anchor marble cactus
+falcon velvet lunar
+```
+
+The fingerprint should bind:
+
+- joining ephemeral key,
+- approving device ephemeral key,
+- request nonce,
+- protocol context.
+
+It exists so a human can detect active network substitution even when the transport is hostile.
+
+## Approval
+
+A trusted existing Shelf device receives the request and displays:
+
+```text
+Add device?
+
+Name: optiprox3
+Platform: Linux/x86_64
+Transport: Tailscale direct
+Fingerprint:
+anchor marble cactus falcon velvet lunar
+```
+
+Approval may require Touch ID, Windows Hello, Kage approval, TPM-backed PIN/user presence, or another configured high-value authorization method.
+
+## Membership grant
+
+The approving device creates:
+
+```rust
+struct MembershipGrant {
+    certificate: MembershipCertificate,
+    key_envelope: EncryptedVaultKeyEnvelope,
+    membership_snapshot: EncryptedMembershipState,
+}
+```
+
+The membership certificate binds:
+
+```text
+vault ID
+device ID
+device signing key
+device hybrid KEM key
+role/capabilities
+serial/epoch
+issuer identity
+issue time
+expiration if used
+```
+
+The grant is signed by an already authorized Shelf device/root authority according to the vault policy.
+
+The vault key material is encrypted specifically to the joining device's hybrid KEM public key.
+
+An interceptor therefore gains no vault secret from the grant.
+
+## Normal nearby enrollment
+
+Preferred UX:
+
+```text
+New device
+  ↓
+show QR enrollment request
+  ↓
+Trusted phone/Mac scans QR
+  ↓
+compare fingerprint
+  ↓
+user approves with biometric/Kage
+  ↓
+devices exchange membership grant directly
+```
+
+The QR should contain an enrollment request plus transport hints, not sensitive vault secrets.
+
+Possible transport hints:
+
+```text
+LAN address
+Tailscale address
+one-time rendezvous token
+```
+
+## Tailscale enrollment
+
+When both devices are on the same tailnet, the joining daemon can advertise a pending request.
+
+Example:
+
+```bash
+$ shelf enroll
+Waiting for approval...
+
+Device: optiprox3
+Fingerprint: anchor marble cactus falcon velvet lunar
+```
+
+Trusted device:
+
+```bash
+$ shelf devices pending
+ID      DEVICE      PATH
+3c87    optiprox3   tailscale/direct
+
+$ shelf devices approve 3c87
+```
+
+Tailscale device identity is useful context but is not sufficient authorization.
+
+## LAN enrollment
+
+A joining device may advertise a minimal enrollment service via mDNS/DNS-SD.
+
+Example:
+
+```text
+_shelf-enroll._udp.local
+```
+
+The LAN is treated as hostile.
+
+Discovery provides only a route to the joining device. The enrollment protocol itself authenticates cryptographic keys and the human-verifiable fingerprint.
+
+## Offline file enrollment
+
+Shelf supports a two-file offline flow:
+
+```text
+.shelfjoin
+.shelfgrant
+```
+
+Joining machine:
+
+```bash
+shelf enroll export > optiprox3.shelfjoin
+```
+
+Trusted machine:
+
+```bash
+shelf enroll approve optiprox3.shelfjoin \
+  --output optiprox3.shelfgrant
+```
+
+Joining machine:
+
+```bash
+shelf enroll import optiprox3.shelfgrant
+```
+
+This works without Tailscale, LAN, a mailbox, or simultaneous connectivity.
+
+## Offline QR enrollment
+
+An optional air-gapped flow may support animated/multi-frame QR transfer.
+
+```text
+request QR frames
+   ↓
+trusted device scans
+   ↓
+approval
+   ↓
+grant QR frames
+   ↓
+joining device scans
+```
+
+This is useful for constrained or air-gapped environments but should not be the normal path.
+
+## Enrollment state machine
+
+Conceptually:
+
+```text
+UNINITIALIZED
+    │
+    ├── init
+    ▼
+IDENTITY_READY
+    │
+    ├── create request
+    ▼
+ENROLLMENT_PENDING
+    │
+    ├── verified request received by trusted member
+    ▼
+APPROVAL_PENDING
+    │
+    ├── user approves
+    ▼
+GRANT_ISSUED
+    │
+    ├── joining device validates certificate + decrypts envelope
+    ▼
+MEMBER
+```
+
+Failure paths return to `IDENTITY_READY` or keep the current pending request until expiry.
+
+## Revocation
+
+Removing a device:
+
+1. emits a signed revocation operation,
+2. advances membership state,
+3. creates a new vault epoch secret,
+4. distributes the new epoch only to remaining authorized members.
+
+The removed device retains whatever old data it previously possessed but cannot decrypt objects created under the new epoch.
+
+## Recovery and the last device
+
+A mailbox cannot recover a lost vault because it has no keys.
+
+Therefore users should be able to create an explicit recovery artifact protected by a strong passphrase and/or external Kage-managed key.
+
+Recovery is a separate trust path and should never silently weaken normal device enrollment.
+
+## Config/state placement
+
+Enrollment state that is not secret lives beneath:
+
+```text
+~/.shelf/
+```
+
+Examples:
+
+```text
+~/.shelf/enrollment/
+~/.shelf/export/
+~/.shelf/state.db
+```
+
+Long-term private key material should instead be held or wrapped by:
+
+- Secure Enclave/Keychain,
+- Windows TPM/CNG,
+- Linux TPM2,
+- Kage,
+- passphrase-encrypted fallback if no hardware-backed provider exists.

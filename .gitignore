@@ -1,0 +1,61 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+*.iml
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# User artifacts (never commit enrollment/recovery material)
+*.shelfjoin
+*.shelfgrant
+
+# Design pack archive (docs live in docs/)
+shelf_design_bundle.zip
+*-docs.zip
+
+# --- Agent / AI local state (do not commit) ---
+.claude/settings.local.json
+.claude/downloads/
+.continuer/
+.continue/
+.aider*
+.airops/
+.autogen/
+.crewai/
+.factory/
+.gemini/
+.goose/
+.grok/
+.junie/
+.kilocode/
+.kiro/
+.codex/
+.crush/
+.neovate/
+.openhands/
+.pi/
+.opencode/
+.qwen/
+.roo/
+.semcoder/
+.trae/
+.windsurf/
+.zencoder/
+.cursor/plans/
+.cursor/projects/
+.cursor/ai-tracking/
+.cursor/*.log
+**/agent-transcripts/
+**/agent-tools/
+*.agent.md.local
