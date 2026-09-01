@@ -3,18 +3,21 @@
 use serde::{Deserialize, Serialize};
 use shelf_core::{
     AeadAlgorithm, ContentKind, Dek, DeviceId, EpochId, HybridTimestamp, ObjectId, PREFERRED_AEAD,
-    Timestamp,
+    RetentionPolicy, Timestamp,
 };
 
 use crate::aad::object_aad;
+use crate::b64;
 use crate::cipher::{open_xchacha, seal_xchacha, xnonce_bytes};
 use crate::error::ProtocolError;
 use crate::wrap::{EpochKey, KeyEnvelope, unwrap_dek, wrap_dek};
 
-/// Envelope format version written by [`seal`] (metadata inside AEAD).
-pub const ENVELOPE_VERSION: u16 = 2;
+/// Envelope format version written by [`seal`] (retention inside AEAD).
+pub const ENVELOPE_VERSION: u16 = 3;
 /// Legacy envelope that carried kind/origin in JSON.
 pub const ENVELOPE_VERSION_V1: u16 = 1;
+/// v2: kind/origin/name/created inside AEAD, no retention.
+pub const ENVELOPE_VERSION_V2: u16 = 2;
 
 /// BLAKE3-256 digest of ciphertext (never of plaintext).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -80,10 +83,12 @@ pub struct EncryptedObject {
     /// Payload AEAD algorithm. v1 seals with XChaCha20-Poly1305 only.
     pub algorithm: AeadAlgorithm,
     /// Payload nonce (24 bytes for XChaCha20-Poly1305).
+    #[serde(with = "b64")]
     pub nonce: Vec<u8>,
     /// DEK wrapped under the epoch key.
     pub wrapped_dek: KeyEnvelope,
-    /// AEAD ciphertext of the object plaintext (and, for v2, inner metadata).
+    /// AEAD ciphertext of the object plaintext (and, for v2+, inner metadata).
+    #[serde(with = "b64")]
     pub ciphertext: Vec<u8>,
     /// BLAKE3 of [`Self::ciphertext`], never of the plaintext.
     pub ciphertext_hash: Hash,
@@ -106,8 +111,12 @@ pub struct OpenedPayload {
     pub origin: DeviceId,
     /// Optional display name (v2).
     pub name: Option<String>,
-    /// Creation timestamp from the inner envelope (v2) or unknown (v1).
+    /// Creation timestamp from the inner envelope (v2+) or unknown (v1).
     pub created: Option<HybridTimestamp>,
+    /// Authenticated absolute expiry (v3).
+    pub expires_at: Option<Timestamp>,
+    /// Authenticated retention class (v3).
+    pub retention_policy: Option<RetentionPolicy>,
 }
 
 /// Seal `plaintext` under a fresh DEK wrapped by `epoch_key`.
@@ -209,7 +218,21 @@ pub fn open(
                 origin,
                 name: None,
                 created: None,
+                expires_at: None,
+                retention_policy: None,
             })
+        }
+        ENVELOPE_VERSION_V2 => {
+            let aad = object_aad(
+                ENVELOPE_VERSION_V2,
+                envelope.object_id,
+                envelope.epoch,
+                envelope.algorithm,
+                None,
+                None,
+            );
+            let inner = open_xchacha(dek.as_bytes(), &nonce, &aad, &envelope.ciphertext)?;
+            decode_inner(&inner, false)
         }
         ENVELOPE_VERSION => {
             let aad = object_aad(
@@ -221,7 +244,7 @@ pub fn open(
                 None,
             );
             let inner = open_xchacha(dek.as_bytes(), &nonce, &aad, &envelope.ciphertext)?;
-            decode_inner(&inner)
+            decode_inner(&inner, true)
         }
         version => Err(ProtocolError::UnsupportedVersion { version }),
     }
@@ -237,8 +260,10 @@ fn encode_inner(
     let kind_bytes = kind.as_wire_str().as_bytes();
     let name_bytes = name.unwrap_or("").as_bytes();
     let created = created.unwrap_or_else(HybridTimestamp::now);
-    let mut out =
-        Vec::with_capacity(1 + kind_bytes.len() + 32 + 2 + name_bytes.len() + 16 + plaintext.len());
+    let retention = shelf_core::Retention::normal(created.wall());
+    let mut out = Vec::with_capacity(
+        1 + kind_bytes.len() + 32 + 2 + name_bytes.len() + 16 + 1 + 8 + plaintext.len(),
+    );
     out.push(u8::try_from(kind_bytes.len()).unwrap_or(0));
     out.extend_from_slice(kind_bytes);
     out.extend_from_slice(origin.as_bytes());
@@ -247,11 +272,19 @@ fn encode_inner(
     out.extend_from_slice(name_bytes);
     out.extend_from_slice(&created.logical().to_be_bytes());
     out.extend_from_slice(&created.wall().as_millis().to_be_bytes());
+    out.push(match retention.policy() {
+        RetentionPolicy::Ephemeral => 0,
+        RetentionPolicy::Normal => 1,
+        RetentionPolicy::Pinned => 2,
+        RetentionPolicy::Custom => 3,
+    });
+    let exp = retention.expires_at().map(|t| t.as_millis()).unwrap_or(0);
+    out.extend_from_slice(&exp.to_be_bytes());
     out.extend_from_slice(plaintext);
     out
 }
 
-fn decode_inner(bytes: &[u8]) -> Result<OpenedPayload, ProtocolError> {
+fn decode_inner(bytes: &[u8], with_retention: bool) -> Result<OpenedPayload, ProtocolError> {
     if bytes.is_empty() {
         return Err(ProtocolError::AeadFailure);
     }
@@ -284,12 +317,36 @@ fn decode_inner(bytes: &[u8]) -> Result<OpenedPayload, ProtocolError> {
     i += 8;
     let wall = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap());
     i += 8;
+    let (expires_at, retention_policy, plaintext) = if with_retention {
+        if bytes.len() < i + 1 + 8 {
+            return Err(ProtocolError::AeadFailure);
+        }
+        let policy = match bytes[i] {
+            0 => RetentionPolicy::Ephemeral,
+            1 => RetentionPolicy::Normal,
+            2 => RetentionPolicy::Pinned,
+            _ => RetentionPolicy::Custom,
+        };
+        i += 1;
+        let exp = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap());
+        i += 8;
+        let expires = if exp == 0 {
+            None
+        } else {
+            Some(Timestamp::from_millis(exp))
+        };
+        (expires, Some(policy), bytes[i..].to_vec())
+    } else {
+        (None, None, bytes[i..].to_vec())
+    };
     Ok(OpenedPayload {
-        plaintext: bytes[i..].to_vec(),
+        plaintext,
         content_kind: kind,
         origin: DeviceId::from_bytes(origin_bytes),
         name,
         created: Some(HybridTimestamp::new(logical, Timestamp::from_millis(wall))),
+        expires_at,
+        retention_policy,
     })
 }
 

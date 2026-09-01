@@ -12,6 +12,8 @@ pub const DOMAIN_ENROLL_SAS: &str = "shelf/enrollment/sas/v1";
 pub const DOMAIN_ENROLL_WRAP: &str = "shelf/enrollment/wrap/v1";
 /// Domain for first-device genesis certificate request-hash.
 pub const DOMAIN_ENROLL_GENESIS: &str = "shelf/enrollment/genesis/v1";
+/// Domain / AEAD AAD for root-authorized epoch rotation wraps.
+pub const DOMAIN_EPOCH_TRANSITION: &str = "shelf/epoch-transition/v1";
 
 /// Accumulates a canonical transcript.
 #[derive(Clone, Debug, Default)]

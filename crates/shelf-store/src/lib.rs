@@ -3,6 +3,7 @@
 #![deny(missing_docs)]
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -10,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use shelf_core::enrollment::MembershipCertificate;
 use shelf_core::{
     ChunkId, ContentKind, DEFAULT_CHUNK_SIZE, DeviceId, EpochId, FileManifest, HlcClock,
-    HybridTimestamp, ObjectId, Retention, ScratchPad, Timestamp, VaultId, scratch_id_for,
+    HybridTimestamp, MembershipSnapshot, ObjectId, Retention, ScratchPad, Timestamp, VaultId,
+    scratch_id_for,
 };
 use shelf_protocol::{EncryptedObject, EpochKey, ProtocolError, open, seal_named};
 use thiserror::Error;
@@ -404,6 +406,22 @@ impl SqliteStore {
         }
     }
 
+    /// Write capability for this device's mailbox (hex).
+    pub fn mailbox_write_cap(&self) -> Result<String, StoreError> {
+        match meta_blob(&self.conn, "mailbox_write_cap")? {
+            Some(bytes) => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// Read/ack capability for this device's mailbox (hex). Never share.
+    pub fn mailbox_read_cap(&self) -> Result<String, StoreError> {
+        match meta_blob(&self.conn, "mailbox_read_cap")? {
+            Some(bytes) => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+            None => Ok(String::new()),
+        }
+    }
+
     /// Epoch key for `epoch`, or [`StoreError::UnknownEpoch`].
     pub fn key_for(&self, epoch: EpochId) -> Result<&EpochKey, StoreError> {
         self.epoch_keys
@@ -442,10 +460,32 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Merge a remote hybrid timestamp into the local HLC.
+    pub fn observe_hlc(&mut self, remote: HybridTimestamp) {
+        self.hlc.observe(remote);
+        let _ = persist_hlc(&self.conn, self.hlc.last());
+    }
+
     fn tick(&mut self) -> HybridTimestamp {
         let ts = self.hlc.now();
         let _ = persist_hlc(&self.conn, ts);
         ts
+    }
+
+    fn scratch_index_key(&self) -> Result<[u8; 32], StoreError> {
+        if let Some(bytes) = meta_blob(&self.conn, "scratch_index_key")?
+            && bytes.len() == 32
+        {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+        let key: [u8; 32] = rand::random();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('scratch_index_key', ?1)",
+            params![key.as_slice()],
+        )?;
+        Ok(key)
     }
 
     fn open_env(
@@ -499,7 +539,7 @@ impl SqliteStore {
             created,
             pinned: false,
             expires_at,
-            name,
+            name: None,
         })?;
         Ok((object_id, created))
     }
@@ -514,19 +554,35 @@ impl SqliteStore {
         mime: String,
         bytes: Vec<u8>,
     ) -> Result<(ObjectId, HybridTimestamp), StoreError> {
+        self.put_file_reader(filename, mime, std::io::Cursor::new(bytes))
+    }
+
+    /// Stream a file from `reader` in 4 MiB chunks (never hold the whole file).
+    pub fn put_file_reader<R: Read>(
+        &mut self,
+        filename: String,
+        mime: String,
+        mut reader: R,
+    ) -> Result<(ObjectId, HybridTimestamp), StoreError> {
         self.gc_expired()?;
         let parent = ObjectId::new();
         let created = self.tick();
         let expires_at = Retention::normal(created.wall()).expires_at();
-        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let mut chunk_ids = Vec::new();
         let chunk_size = usize::try_from(DEFAULT_CHUNK_SIZE).unwrap_or(4 * 1024 * 1024);
-        for chunk in bytes.chunks(chunk_size.max(1)) {
+        let mut buf = vec![0u8; chunk_size.max(1)];
+        let mut size = 0u64;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            size = size.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
             let chunk_id = ChunkId::new();
             chunk_ids.push(chunk_id);
             let chunk_oid = ObjectId::from_bytes(*chunk_id.as_bytes());
             let envelope = seal_named(
-                chunk,
+                &buf[..n],
                 chunk_oid,
                 self.epoch,
                 &self.epoch_key,
@@ -554,7 +610,7 @@ impl SqliteStore {
             created,
             pinned: false,
             expires_at,
-            name: Some(filename),
+            name: None,
         })?;
         Ok((parent, created))
     }
@@ -563,7 +619,7 @@ impl SqliteStore {
     pub fn export_objects(&self) -> Result<Vec<SealedRecord>, StoreError> {
         self.gc_expired()?;
         let mut stmt = self.conn.prepare(
-            "SELECT envelope, created_logical, created_wall, pinned, expires_at, name
+            "SELECT envelope, created_logical, created_wall, pinned, expires_at
              FROM objects",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -572,19 +628,18 @@ impl SqliteStore {
             let wall: i64 = row.get(2)?;
             let pinned: i64 = row.get(3)?;
             let expires: Option<i64> = row.get(4)?;
-            let name: Option<String> = row.get(5)?;
-            Ok((envelope_json, logical, wall, pinned, expires, name))
+            Ok((envelope_json, logical, wall, pinned, expires))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (envelope_json, logical, wall, pinned, expires, name) = row?;
+            let (envelope_json, logical, wall, pinned, expires) = row?;
             let envelope: EncryptedObject = serde_json::from_str(&envelope_json)?;
             out.push(SealedRecord {
                 envelope,
                 created: HybridTimestamp::new(logical as u64, Timestamp::from_millis(wall as u64)),
                 pinned: pinned != 0,
                 expires_at: expires.map(|m| Timestamp::from_millis(millis_from_sql(m))),
-                name,
+                name: None,
             });
         }
         Ok(out)
@@ -710,6 +765,157 @@ impl SqliteStore {
         Ok(next)
     }
 
+    /// Persist a signed operation. `Ok(false)` means a duplicate `op_id`.
+    ///
+    /// A second op with the same `(origin, seq)` and a different `op_id` is rejected.
+    pub fn persist_signed_op(
+        &self,
+        origin: DeviceId,
+        seq: u64,
+        op_id: &str,
+        dedupe: Option<&str>,
+        json: &str,
+    ) -> Result<bool, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ops WHERE op_id = ?1",
+            params![op_id],
+            |row| row.get(0),
+        )?;
+        if n > 0 {
+            return Ok(false);
+        }
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT op_id FROM ops WHERE origin = ?1 AND seq = ?2",
+                params![origin.as_bytes().as_slice(), seq as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            if id == op_id {
+                return Ok(false);
+            }
+            return Err(StoreError::InvalidOp);
+        }
+        self.conn.execute(
+            "INSERT INTO ops(op_id, seq, origin, body, dedupe) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                op_id,
+                seq as i64,
+                origin.as_bytes().as_slice(),
+                json,
+                dedupe,
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Highest applied seq per origin (anti-entropy cursors).
+    pub fn op_cursors(&self) -> Result<Vec<(DeviceId, u64)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT origin, MAX(seq) FROM ops GROUP BY origin")?;
+        let rows = stmt.query_map([], |row| {
+            let origin: Vec<u8> = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            Ok((origin, seq))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (origin, seq) = row?;
+            let bytes: [u8; 32] = origin.try_into().map_err(|_| StoreError::InvalidOp)?;
+            out.push((DeviceId::from_bytes(bytes), seq as u64));
+        }
+        Ok(out)
+    }
+
+    /// Signed ops with seq greater than the peer's cursor for that origin.
+    pub fn export_ops_after(&self, cursors: &[(DeviceId, u64)]) -> Result<Vec<String>, StoreError> {
+        let all = self.export_ops_json()?;
+        let mut out = Vec::new();
+        for json in all {
+            let parsed: serde_json::Value = serde_json::from_str(&json)?;
+            let seq = parsed
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let origin = parsed
+                .get("origin")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<DeviceId>(v).ok());
+            let Some(origin) = origin else {
+                continue;
+            };
+            let peer_seq = cursors
+                .iter()
+                .find(|(id, _)| *id == origin)
+                .map(|(_, s)| *s)
+                .unwrap_or(0);
+            if seq > peer_seq {
+                out.push(json);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Persist the root-signed membership snapshot.
+    pub fn save_membership_snapshot(&self, snap: &MembershipSnapshot) -> Result<(), StoreError> {
+        let json = serde_json::to_vec(snap)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('membership_snapshot', ?1)",
+            params![json],
+        )?;
+        Ok(())
+    }
+
+    /// Queue a root-issued epoch transition for the replica op log.
+    pub fn save_pending_epoch_transition(&self, json: &[u8]) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('pending_epoch_transition', ?1)",
+            params![json],
+        )?;
+        Ok(())
+    }
+
+    /// Take a queued epoch transition payload, if any.
+    pub fn take_pending_epoch_transition(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let bytes = meta_blob(&self.conn, "pending_epoch_transition")?;
+        if bytes.is_some() {
+            self.conn
+                .execute("DELETE FROM meta WHERE k = 'pending_epoch_transition'", [])?;
+        }
+        Ok(bytes)
+    }
+
+    /// Load the stored membership snapshot, if any.
+    pub fn membership_snapshot(&self) -> Result<Option<MembershipSnapshot>, StoreError> {
+        match meta_blob(&self.conn, "membership_snapshot")? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Members from a verified snapshot (not loose table rows).
+    pub fn validated_members(&self) -> Result<Vec<shelf_core::MembershipCertificate>, StoreError> {
+        let Some(root) = self.vault_root()? else {
+            return Ok(Vec::new());
+        };
+        let Some(snap) = self.membership_snapshot()? else {
+            return Ok(Vec::new());
+        };
+        if !snap.verify(&root) {
+            return Err(StoreError::InvalidOp);
+        }
+        let now = Timestamp::now();
+        Ok(snap
+            .certificates
+            .into_iter()
+            .filter(|c| c.vault_id == self.vault_id)
+            .filter(|c| c.expires_at.is_none_or(|t| t > now))
+            .collect())
+    }
+
     /// Persist a signed operation JSON keyed by `dedupe` (insert-or-ignore).
     pub fn append_op_json(&self, dedupe: &str, json: &str) -> Result<(), StoreError> {
         let parsed: serde_json::Value = serde_json::from_str(json)?;
@@ -722,13 +928,8 @@ impl SqliteStore {
             .and_then(serde_json::Value::as_u64)
             .ok_or(StoreError::InvalidOp)?;
         let origin = parsed.get("origin").cloned().ok_or(StoreError::InvalidOp)?;
-        let origin_bytes = serde_json::from_value::<DeviceId>(origin)?
-            .as_bytes()
-            .to_vec();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO ops(op_id, seq, origin, body, dedupe) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![op_id, seq as i64, origin_bytes, json, dedupe],
-        )?;
+        let origin = serde_json::from_value::<DeviceId>(origin)?;
+        let _ = self.persist_signed_op(origin, seq, op_id, Some(dedupe), json)?;
         Ok(())
     }
 
@@ -765,17 +966,18 @@ impl SqliteStore {
         created: HybridTimestamp,
         pinned: bool,
         expires_at: Option<Timestamp>,
-        name: Option<String>,
+        _name: Option<String>,
     ) -> Result<(), StoreError> {
         if self.is_tombstoned(envelope.object_id)? {
             return Ok(());
         }
+        self.observe_hlc(created);
         self.insert_row(StoredRow {
             envelope,
             created,
             pinned,
             expires_at,
-            name,
+            name: None,
         })
     }
 
@@ -875,6 +1077,9 @@ impl SqliteStore {
         if opened.content_kind != ContentKind::Scratch {
             return Err(StoreError::InvalidScratch);
         }
+        if let Some(created) = opened.created {
+            self.observe_hlc(created);
+        }
         let (name, update) = decode_scratch_body(&opened.plaintext)?;
         let mut pad = self.load_scratch(&name)?;
         pad.apply_update(&update)?;
@@ -884,7 +1089,7 @@ impl SqliteStore {
 
     /// Sealed envelope for a pad, if it exists.
     pub fn scratch_envelope(&self, name: &str) -> Result<Option<EncryptedObject>, StoreError> {
-        let id = scratch_id_for(self.vault_id, name);
+        let id = scratch_id_for(&self.scratch_index_key()?, name);
         let json: Option<String> = self
             .conn
             .query_row(
@@ -931,7 +1136,7 @@ impl SqliteStore {
     }
 
     fn load_scratch(&self, name: &str) -> Result<ScratchPad, StoreError> {
-        let id = scratch_id_for(self.vault_id, name);
+        let id = scratch_id_for(&self.scratch_index_key()?, name);
         let json: Option<String> = self
             .conn
             .query_row(
@@ -957,7 +1162,7 @@ impl SqliteStore {
     }
 
     fn persist_scratch(&self, name: &str, pad: &ScratchPad) -> Result<(), StoreError> {
-        let id = scratch_id_for(self.vault_id, name);
+        let id = scratch_id_for(&self.scratch_index_key()?, name);
         let body = encode_scratch_body(name, &pad.encode_update());
         let object_id = ObjectId::from_bytes(*id.as_bytes());
         let env = seal_named(
@@ -1232,6 +1437,10 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
         "CREATE UNIQUE INDEX IF NOT EXISTS ops_dedupe ON ops(dedupe) WHERE dedupe IS NOT NULL",
         [],
     );
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ops_origin_seq ON ops(origin, seq)",
+        [],
+    );
     Ok(())
 }
 
@@ -1311,6 +1520,21 @@ fn persist_identity(
     conn.execute(
         "INSERT INTO meta(k, v) VALUES ('mailbox_id', ?1)",
         params![mailbox.as_slice()],
+    )?;
+    let write_cap: [u8; 32] = rand::random();
+    conn.execute(
+        "INSERT INTO meta(k, v) VALUES ('mailbox_write_cap', ?1)",
+        params![write_cap.as_slice()],
+    )?;
+    let read_cap: [u8; 32] = rand::random();
+    conn.execute(
+        "INSERT INTO meta(k, v) VALUES ('mailbox_read_cap', ?1)",
+        params![read_cap.as_slice()],
+    )?;
+    let scratch_key: [u8; 32] = rand::random();
+    conn.execute(
+        "INSERT INTO meta(k, v) VALUES ('scratch_index_key', ?1)",
+        params![scratch_key.as_slice()],
     )?;
     conn.execute(
         "INSERT INTO epoch_wraps(epoch, wrapped) VALUES (?1, ?2)",
@@ -1621,5 +1845,47 @@ mod tests {
         store.append_op_json("pin:x", &json).unwrap();
         assert_eq!(store.export_ops_json().unwrap().len(), 1);
         assert!(store.has_op_dedupe("pin:x").unwrap());
+    }
+
+    #[test]
+    fn persist_signed_op_rejects_origin_seq_conflict() {
+        let store = SqliteStore::memory();
+        let origin = store.device_id();
+        store
+            .persist_signed_op(origin, 1, "op-a", Some("a"), "{\"op\":1}")
+            .unwrap();
+        let err = store
+            .persist_signed_op(origin, 1, "op-b", Some("b"), "{\"op\":2}")
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidOp));
+        assert!(
+            !store
+                .persist_signed_op(origin, 1, "op-a", Some("a"), "{\"op\":1}")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn validated_members_rejects_unsigned_snapshot() {
+        let store = SqliteStore::memory();
+        let root = shelf_core::VaultRoot {
+            vault_id: store.vault_id(),
+            root_signing_pubkey: shelf_core::SigningPublicKey::from_bytes([1; 32]),
+            generation: 1,
+        };
+        store.save_vault_root(&root).unwrap();
+        let snap = MembershipSnapshot {
+            vault_root: root,
+            generation: 1,
+            epoch: store.epoch(),
+            certificates: vec![],
+            mailbox_bindings: vec![],
+            snapshot_signature: shelf_core::SignatureBytes::from_bytes([0; 64]),
+        };
+        store.save_membership_snapshot(&snap).unwrap();
+        assert!(matches!(
+            store.validated_members(),
+            Err(StoreError::InvalidOp)
+        ));
     }
 }

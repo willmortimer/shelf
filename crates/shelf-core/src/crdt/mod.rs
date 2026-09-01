@@ -4,8 +4,6 @@
 //! collaborative text documents with their own merge semantics.
 
 use crate::hexutil::define_id32;
-use crate::identity::VaultId;
-use crate::transcript::Transcript;
 use thiserror::Error;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
@@ -15,13 +13,13 @@ define_id32! {
     pub struct ScratchId;
 }
 
-/// Derive a stable pad id from vault + human name (name is not stored as a key).
+/// Derive a stable pad id from a vault-local index key + human name.
+///
+/// The key is random per vault (not `VaultId`) so a stolen `state.db` cannot
+/// dictionary-test pad names from the id alone.
 #[must_use]
-pub fn scratch_id_for(vault_id: VaultId, name: &str) -> ScratchId {
-    let mut t = Transcript::new("shelf/scratch/id/v1");
-    t.push_fixed(vault_id.as_bytes());
-    t.push_bytes(name.as_bytes());
-    ScratchId::from_bytes(t.hash())
+pub fn scratch_id_for(index_key: &[u8; 32], name: &str) -> ScratchId {
+    ScratchId::from_bytes(*blake3::keyed_hash(index_key, name.as_bytes()).as_bytes())
 }
 
 /// Failure applying or decoding a Yrs update.

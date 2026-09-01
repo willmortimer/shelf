@@ -33,6 +33,15 @@ fn seal_then_open_recovers_plaintext() {
 }
 
 #[test]
+fn envelope_json_uses_base64_not_byte_array() {
+    let (envelope, epoch_key) = seal_fixture(b"secret");
+    let json = serde_json::to_string(&envelope).unwrap();
+    assert!(!json.contains("[53,"), "{json}");
+    assert!(json.contains(r#""ciphertext":""#), "{json}");
+    assert!(open(&envelope, &epoch_key).unwrap().expires_at.is_some());
+}
+
+#[test]
 fn empty_plaintext_round_trips() {
     let (envelope, epoch_key) = seal_fixture(b"");
     let opened = open(&envelope, &epoch_key).unwrap();
