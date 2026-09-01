@@ -5,7 +5,18 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "shelf_mailbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shelf-mailbox"
+path = "src/main.rs"
+
 [dependencies]
+base64.workspace = true
+clap.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
