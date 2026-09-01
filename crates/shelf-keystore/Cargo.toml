@@ -6,5 +6,19 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+argon2.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+ml-kem.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shelf-core.workspace = true
+shelf-protocol.workspace = true
+shelf-store.workspace = true
 thiserror.workspace = true
+x25519-dalek.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
