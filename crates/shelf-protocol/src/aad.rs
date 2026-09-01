@@ -18,16 +18,19 @@ pub(crate) fn algorithm_tag(algorithm: AeadAlgorithm) -> u8 {
 
 /// AAD for object-payload XChaCha20-Poly1305.
 ///
-/// Layout:
+/// v1 layout:
 /// `domain_len || domain || version_be || object_id || epoch_be || alg_tag
 ///  || kind_len || kind || origin`
+///
+/// v2 layout (kind/origin live inside the AEAD plaintext):
+/// `domain_len || domain || version_be || object_id || epoch_be || alg_tag`
 pub(crate) fn object_aad(
     version: u16,
     object_id: ObjectId,
     epoch: EpochId,
     algorithm: AeadAlgorithm,
-    content_kind: ContentKind,
-    origin: DeviceId,
+    content_kind: Option<ContentKind>,
+    origin: Option<DeviceId>,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
     push_label(&mut buf, DOMAIN_OBJECT);
@@ -35,8 +38,12 @@ pub(crate) fn object_aad(
     buf.extend_from_slice(object_id.as_bytes());
     buf.extend_from_slice(&epoch.as_u64().to_be_bytes());
     buf.push(algorithm_tag(algorithm));
-    push_label(&mut buf, content_kind.as_wire_str());
-    buf.extend_from_slice(origin.as_bytes());
+    if version < 2 {
+        let kind = content_kind.expect("v1 AAD requires content kind");
+        let origin = origin.expect("v1 AAD requires origin");
+        push_label(&mut buf, kind.as_wire_str());
+        buf.extend_from_slice(origin.as_bytes());
+    }
     buf
 }
 

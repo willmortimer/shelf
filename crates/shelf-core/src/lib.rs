@@ -16,9 +16,10 @@ pub mod identity;
 pub mod model;
 pub mod retention;
 pub mod sync;
+pub mod transcript;
 
 pub use blob::{ChunkId, DEFAULT_CHUNK_SIZE, FileManifest};
-pub use crdt::{CrdtError, ScratchPad};
+pub use crdt::{CrdtError, ScratchId, ScratchPad, scratch_id_for};
 pub use crypto::{
     AeadAlgorithm, DOMAIN_CHUNK, DOMAIN_ENROLLMENT, DOMAIN_MEMBERSHIP, DOMAIN_METADATA,
     DOMAIN_OBJECT, DOMAIN_SEARCH, Dek, EpochId, HybridKemProfile, PREFERRED_AEAD, PreferredAead,
@@ -27,16 +28,25 @@ pub use crypto::{
 pub use enrollment::{
     DeviceCapabilities, ENROLLMENT_PROTOCOL_VERSION, EncryptedMembershipState,
     EncryptedVaultKeyEnvelope, EnrollmentError, EnrollmentEvent, EnrollmentRequest,
-    EnrollmentState, MemberRole, MembershipCertificate, MembershipGrant, SignatureBytes,
-    TransportHint,
+    EnrollmentState, MemberRole, MembershipCertificate, MembershipGrant, MembershipSnapshot,
+    SignatureBytes, TransportHint, VaultRoot,
 };
 pub use identity::{
     DeviceId, DevicePublicIdentity, HybridKemPublicKey, IdentityError, ML_KEM_768_PUBLIC_KEY_LEN,
     MlKem768PublicKey, SigningPublicKey, VaultId, X25519PublicKey,
 };
-pub use model::{ContentKind, ContentRef, HybridTimestamp, Label, ObjectId, ShelfItem, Timestamp};
+pub use model::{
+    ContentKind, ContentRef, HlcClock, HybridTimestamp, Label, ObjectId, ShelfItem, Timestamp,
+};
+
+/// Maximum newline-delimited JSON frame on IPC, mailbox, and peer sockets.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub use retention::{EPHEMERAL_TTL, ExpireObject, NORMAL_TTL, Retention, RetentionPolicy};
 pub use sync::{Peer, PeerId, PeerTransport};
+pub use transcript::{
+    DOMAIN_ENROLL_CERT, DOMAIN_ENROLL_GENESIS, DOMAIN_ENROLL_REQUEST, DOMAIN_ENROLL_SAS,
+    DOMAIN_ENROLL_SNAPSHOT, DOMAIN_ENROLL_WRAP, Transcript,
+};
 
 #[cfg(test)]
 mod tests;

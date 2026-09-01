@@ -107,6 +107,12 @@ impl EpochId {
     pub const fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Next epoch after a revocation.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
 }
 
 /// 256-bit data-encryption key. Random per object; never derived from plaintext.

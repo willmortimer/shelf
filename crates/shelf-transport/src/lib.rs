@@ -18,8 +18,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
 mod frame;
+mod session;
 
-pub use frame::{ReplicaFrame, parse_sig_hex, sig_hex};
+pub use frame::{OpBody, ReplicaFrame, SignedOperation, new_op_id, parse_sig_hex, sig_hex};
+pub use session::{
+    SessionHello, accept_tls, connect_tls, hello_transcript, read_bounded_line,
+    tls_exporter_client, tls_exporter_server, write_bounded_line,
+};
 pub use shelf_mailbox::{MailboxClient, MailboxError, MailboxItem};
 
 /// Transport failures.
@@ -357,6 +362,7 @@ mod tests {
             DeviceId::new(),
             epoch,
             vault,
+            &[0xEE; 32],
         )
         .unwrap();
         let mut b = SqliteStore::open(
@@ -365,6 +371,7 @@ mod tests {
             DeviceId::new(),
             epoch,
             vault,
+            &[0xEE; 32],
         )
         .unwrap();
         let (id, _) = a

@@ -90,6 +90,9 @@ pub struct HybridTimestamp {
 
 impl HybridTimestamp {
     /// Capture the current wall clock with logical counter `0`.
+    ///
+    /// Replicas must use [`HlcClock`] so successive events on the same
+    /// millisecond are strictly ordered.
     #[must_use]
     pub fn now() -> Self {
         Self {
@@ -131,6 +134,58 @@ impl Ord for HybridTimestamp {
     }
 }
 
+/// Stateful hybrid logical clock. Tick and observe remote timestamps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HlcClock {
+    last: HybridTimestamp,
+}
+
+impl Default for HlcClock {
+    fn default() -> Self {
+        Self {
+            last: HybridTimestamp::new(0, Timestamp::from_millis(0)),
+        }
+    }
+}
+
+impl HlcClock {
+    /// Construct from a previously persisted timestamp.
+    #[must_use]
+    pub const fn from_last(last: HybridTimestamp) -> Self {
+        Self { last }
+    }
+
+    /// Last issued timestamp.
+    #[must_use]
+    pub const fn last(&self) -> HybridTimestamp {
+        self.last
+    }
+
+    /// Issue a timestamp strictly greater than the last local or observed one.
+    pub fn now(&mut self) -> HybridTimestamp {
+        let wall = Timestamp::now();
+        if wall > self.last.wall() {
+            self.last = HybridTimestamp::new(0, wall);
+        } else {
+            let wall = wall.max(self.last.wall());
+            self.last = HybridTimestamp::new(self.last.logical().saturating_add(1), wall);
+        }
+        self.last
+    }
+
+    /// Merge a remote timestamp into the clock (receive path).
+    pub fn observe(&mut self, remote: HybridTimestamp) {
+        if remote > self.last {
+            self.last = remote;
+        } else if remote.wall() == self.last.wall() {
+            self.last = HybridTimestamp::new(
+                self.last.logical().max(remote.logical()).saturating_add(1),
+                self.last.wall(),
+            );
+        }
+    }
+}
+
 /// Initial content classification for a Shelf object.
 ///
 /// Wire names are kebab-case to match the design contract.
@@ -151,6 +206,8 @@ pub enum ContentKind {
     Json,
     /// Uninterpreted bytes.
     OpaqueBytes,
+    /// Encrypted scratch pad (Yrs update). Not a `shelf put` kind.
+    Scratch,
 }
 
 impl ContentKind {
@@ -165,6 +222,23 @@ impl ContentKind {
             Self::File => "file",
             Self::Json => "json",
             Self::OpaqueBytes => "opaque-bytes",
+            Self::Scratch => "scratch",
+        }
+    }
+
+    /// Parse a kebab-case wire name.
+    #[must_use]
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "text" => Some(Self::Text),
+            "markdown" => Some(Self::Markdown),
+            "url" => Some(Self::Url),
+            "image" => Some(Self::Image),
+            "file" => Some(Self::File),
+            "json" => Some(Self::Json),
+            "opaque-bytes" => Some(Self::OpaqueBytes),
+            "scratch" => Some(Self::Scratch),
+            _ => None,
         }
     }
 }

@@ -14,7 +14,10 @@ mod hybrid;
 mod sas;
 mod wrap;
 
-pub use envelope::{ENVELOPE_VERSION, EncryptedObject, Hash, open, seal};
+pub use envelope::{
+    ENVELOPE_VERSION, ENVELOPE_VERSION_V1, EncryptedObject, Hash, OpenedPayload, open, seal,
+    seal_named,
+};
 pub use error::ProtocolError;
 pub use hybrid::{HybridEpochWrap, unwrap_epoch_key, wrap_epoch_key};
 pub use sas::{sas_display, sas_words};

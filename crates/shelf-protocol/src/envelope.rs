@@ -1,15 +1,20 @@
 //! Versioned encrypted object envelopes.
 
 use serde::{Deserialize, Serialize};
-use shelf_core::{AeadAlgorithm, ContentKind, Dek, DeviceId, EpochId, ObjectId, PREFERRED_AEAD};
+use shelf_core::{
+    AeadAlgorithm, ContentKind, Dek, DeviceId, EpochId, HybridTimestamp, ObjectId, PREFERRED_AEAD,
+    Timestamp,
+};
 
 use crate::aad::object_aad;
 use crate::cipher::{open_xchacha, seal_xchacha, xnonce_bytes};
 use crate::error::ProtocolError;
 use crate::wrap::{EpochKey, KeyEnvelope, unwrap_dek, wrap_dek};
 
-/// Envelope format version written by [`seal`].
-pub const ENVELOPE_VERSION: u16 = 1;
+/// Envelope format version written by [`seal`] (metadata inside AEAD).
+pub const ENVELOPE_VERSION: u16 = 2;
+/// Legacy envelope that carried kind/origin in JSON.
+pub const ENVELOPE_VERSION_V1: u16 = 1;
 
 /// BLAKE3-256 digest of ciphertext (never of plaintext).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,10 +67,8 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Encrypted object envelope for storage and replication.
 ///
-/// Payload AEAD additional data binds protocol version, object id, epoch,
-/// algorithm, content kind, and origin device id. `content_kind` and `origin`
-/// are carried on the envelope so honest replicas can reconstruct AAD; they
-/// are authenticated, not trusted as plaintext metadata.
+/// v2 keeps kind, origin, name, and created timestamps inside the AEAD
+/// plaintext. JSON on the wire is object id, epoch, wrap, and ciphertext.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedObject {
     /// Envelope format version. Currently [`ENVELOPE_VERSION`].
@@ -80,14 +83,31 @@ pub struct EncryptedObject {
     pub nonce: Vec<u8>,
     /// DEK wrapped under the epoch key.
     pub wrapped_dek: KeyEnvelope,
-    /// AEAD ciphertext of the object plaintext.
+    /// AEAD ciphertext of the object plaintext (and, for v2, inner metadata).
     pub ciphertext: Vec<u8>,
     /// BLAKE3 of [`Self::ciphertext`], never of the plaintext.
     pub ciphertext_hash: Hash,
-    /// Content class bound into AAD.
+    /// v1 only: content class. Omitted on v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_kind: Option<ContentKind>,
+    /// v1 only: originating device. Omitted on v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<DeviceId>,
+}
+
+/// Opened envelope: plaintext plus authenticated inner metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedPayload {
+    /// Object bytes (Yrs update, file chunk, or user payload).
+    pub plaintext: Vec<u8>,
+    /// Authenticated content class.
     pub content_kind: ContentKind,
-    /// Originating device bound into AAD.
+    /// Authenticated origin device.
     pub origin: DeviceId,
+    /// Optional display name (v2).
+    pub name: Option<String>,
+    /// Creation timestamp from the inner envelope (v2) or unknown (v1).
+    pub created: Option<HybridTimestamp>,
 }
 
 /// Seal `plaintext` under a fresh DEK wrapped by `epoch_key`.
@@ -101,20 +121,38 @@ pub fn seal(
     content_kind: ContentKind,
     origin: DeviceId,
 ) -> Result<EncryptedObject, ProtocolError> {
+    seal_named(
+        plaintext,
+        object_id,
+        epoch,
+        epoch_key,
+        content_kind,
+        origin,
+        None,
+        None,
+    )
+}
+
+/// Seal with optional name and creation timestamp bound into the inner body.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_named(
+    plaintext: &[u8],
+    object_id: ObjectId,
+    epoch: EpochId,
+    epoch_key: &EpochKey,
+    content_kind: ContentKind,
+    origin: DeviceId,
+    name: Option<&str>,
+    created: Option<HybridTimestamp>,
+) -> Result<EncryptedObject, ProtocolError> {
     let algorithm = PREFERRED_AEAD;
     require_payload_algorithm(algorithm)?;
 
     let dek = Dek::new();
     let nonce: [u8; 24] = rand::random();
-    let aad = object_aad(
-        ENVELOPE_VERSION,
-        object_id,
-        epoch,
-        algorithm,
-        content_kind,
-        origin,
-    );
-    let ciphertext = seal_xchacha(dek.as_bytes(), &nonce, &aad, plaintext)?;
+    let inner = encode_inner(content_kind, origin, name, created, plaintext);
+    let aad = object_aad(ENVELOPE_VERSION, object_id, epoch, algorithm, None, None);
+    let ciphertext = seal_xchacha(dek.as_bytes(), &nonce, &aad, &inner)?;
     let ciphertext_hash = Hash::of_ciphertext(&ciphertext);
     let wrapped_dek = wrap_dek(&dek, object_id, epoch, epoch_key)?;
 
@@ -127,32 +165,17 @@ pub fn seal(
         wrapped_dek,
         ciphertext,
         ciphertext_hash,
-        content_kind,
-        origin,
+        content_kind: None,
+        origin: None,
     })
 }
 
-/// Open `envelope` and recover the plaintext.
-///
-/// `content_kind` and `origin` must match the values used at [`seal`]. They
-/// are compared to the envelope fields and then rebound into AAD so a mismatch
-/// cannot decrypt.
+/// Open `envelope` and recover plaintext plus inner metadata.
 pub fn open(
     envelope: &EncryptedObject,
     epoch_key: &EpochKey,
-    content_kind: ContentKind,
-    origin: DeviceId,
-) -> Result<Vec<u8>, ProtocolError> {
-    if envelope.version != ENVELOPE_VERSION {
-        return Err(ProtocolError::UnsupportedVersion {
-            version: envelope.version,
-        });
-    }
+) -> Result<OpenedPayload, ProtocolError> {
     require_payload_algorithm(envelope.algorithm)?;
-    if envelope.content_kind != content_kind || envelope.origin != origin {
-        return Err(ProtocolError::AeadFailure);
-    }
-
     let expected_hash = Hash::of_ciphertext(&envelope.ciphertext);
     if expected_hash != envelope.ciphertext_hash {
         return Err(ProtocolError::HashMismatch);
@@ -166,15 +189,108 @@ pub fn open(
         envelope.epoch,
         epoch_key,
     )?;
-    let aad = object_aad(
-        envelope.version,
-        envelope.object_id,
-        envelope.epoch,
-        envelope.algorithm,
-        content_kind,
-        origin,
-    );
-    open_xchacha(dek.as_bytes(), &nonce, &aad, &envelope.ciphertext)
+
+    match envelope.version {
+        ENVELOPE_VERSION_V1 => {
+            let kind = envelope.content_kind.ok_or(ProtocolError::AeadFailure)?;
+            let origin = envelope.origin.ok_or(ProtocolError::AeadFailure)?;
+            let aad = object_aad(
+                ENVELOPE_VERSION_V1,
+                envelope.object_id,
+                envelope.epoch,
+                envelope.algorithm,
+                Some(kind),
+                Some(origin),
+            );
+            let plaintext = open_xchacha(dek.as_bytes(), &nonce, &aad, &envelope.ciphertext)?;
+            Ok(OpenedPayload {
+                plaintext,
+                content_kind: kind,
+                origin,
+                name: None,
+                created: None,
+            })
+        }
+        ENVELOPE_VERSION => {
+            let aad = object_aad(
+                ENVELOPE_VERSION,
+                envelope.object_id,
+                envelope.epoch,
+                envelope.algorithm,
+                None,
+                None,
+            );
+            let inner = open_xchacha(dek.as_bytes(), &nonce, &aad, &envelope.ciphertext)?;
+            decode_inner(&inner)
+        }
+        version => Err(ProtocolError::UnsupportedVersion { version }),
+    }
+}
+
+fn encode_inner(
+    kind: ContentKind,
+    origin: DeviceId,
+    name: Option<&str>,
+    created: Option<HybridTimestamp>,
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let kind_bytes = kind.as_wire_str().as_bytes();
+    let name_bytes = name.unwrap_or("").as_bytes();
+    let created = created.unwrap_or_else(HybridTimestamp::now);
+    let mut out =
+        Vec::with_capacity(1 + kind_bytes.len() + 32 + 2 + name_bytes.len() + 16 + plaintext.len());
+    out.push(u8::try_from(kind_bytes.len()).unwrap_or(0));
+    out.extend_from_slice(kind_bytes);
+    out.extend_from_slice(origin.as_bytes());
+    let name_len = u16::try_from(name_bytes.len()).unwrap_or(0);
+    out.extend_from_slice(&name_len.to_be_bytes());
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(&created.logical().to_be_bytes());
+    out.extend_from_slice(&created.wall().as_millis().to_be_bytes());
+    out.extend_from_slice(plaintext);
+    out
+}
+
+fn decode_inner(bytes: &[u8]) -> Result<OpenedPayload, ProtocolError> {
+    if bytes.is_empty() {
+        return Err(ProtocolError::AeadFailure);
+    }
+    let kind_len = usize::from(bytes[0]);
+    let mut i = 1;
+    if bytes.len() < i + kind_len + 32 + 2 {
+        return Err(ProtocolError::AeadFailure);
+    }
+    let kind_str =
+        std::str::from_utf8(&bytes[i..i + kind_len]).map_err(|_| ProtocolError::AeadFailure)?;
+    let kind = ContentKind::from_wire_str(kind_str).ok_or(ProtocolError::AeadFailure)?;
+    i += kind_len;
+    let mut origin_bytes = [0u8; 32];
+    origin_bytes.copy_from_slice(&bytes[i..i + 32]);
+    i += 32;
+    let name_len = u16::from_be_bytes(bytes[i..i + 2].try_into().unwrap()) as usize;
+    i += 2;
+    if bytes.len() < i + name_len + 16 {
+        return Err(ProtocolError::AeadFailure);
+    }
+    let name = if name_len == 0 {
+        None
+    } else {
+        let s =
+            std::str::from_utf8(&bytes[i..i + name_len]).map_err(|_| ProtocolError::AeadFailure)?;
+        Some(s.to_owned())
+    };
+    i += name_len;
+    let logical = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap());
+    i += 8;
+    let wall = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap());
+    i += 8;
+    Ok(OpenedPayload {
+        plaintext: bytes[i..].to_vec(),
+        content_kind: kind,
+        origin: DeviceId::from_bytes(origin_bytes),
+        name,
+        created: Some(HybridTimestamp::new(logical, Timestamp::from_millis(wall))),
+    })
 }
 
 fn require_payload_algorithm(algorithm: AeadAlgorithm) -> Result<(), ProtocolError> {

@@ -110,7 +110,7 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
-    if n == 0 || line.trim().is_empty() {
+    if n == 0 || line.trim().is_empty() || line.len() > shelf_core::MAX_FRAME_BYTES {
         return Ok(());
     }
 
@@ -234,6 +234,14 @@ fn store_error(err: StoreError) -> IpcResponse {
             code: IpcErrorCode::Protocol,
             message: err.to_string(),
         },
+        StoreError::InvalidScratch => IpcResponse::Error {
+            code: IpcErrorCode::Protocol,
+            message: "invalid scratch envelope".into(),
+        },
+        StoreError::UnknownEpoch | StoreError::InvalidOp => IpcResponse::Error {
+            code: IpcErrorCode::Protocol,
+            message: err.to_string(),
+        },
     }
 }
 
@@ -280,7 +288,7 @@ async fn handle_windows_pipe(
         let mut reader = BufReader::new(&mut stream);
         reader.read_line(&mut line).await?
     };
-    if n == 0 || line.trim().is_empty() {
+    if n == 0 || line.trim().is_empty() || line.len() > shelf_core::MAX_FRAME_BYTES {
         return Ok(());
     }
     let response = match serde_json::from_str::<IpcRequest>(line.trim_end()) {

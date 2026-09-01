@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::Timestamp;
-use crate::blob::DEFAULT_CHUNK_SIZE;
 use crate::crdt::ScratchPad;
 use crate::crypto::{Dek, all_domain_labels};
 use crate::enrollment::{EnrollmentError, EnrollmentEvent, EnrollmentState};
@@ -57,6 +56,7 @@ fn content_kind_serde_round_trip() {
         ContentKind::File,
         ContentKind::Json,
         ContentKind::OpaqueBytes,
+        ContentKind::Scratch,
     ];
     for kind in kinds {
         let json = serde_json::to_string(&kind).unwrap();
@@ -164,6 +164,12 @@ fn expire_object_fields() {
 }
 
 #[test]
-fn file_manifest_chunk_size_constant() {
-    assert_eq!(DEFAULT_CHUNK_SIZE, 4 * 1024 * 1024);
+fn hlc_orders_successive_ticks() {
+    let mut clock = crate::HlcClock::default();
+    let a = clock.now();
+    let b = clock.now();
+    assert!(b > a);
+    clock.observe(b);
+    let c = clock.now();
+    assert!(c > b);
 }
