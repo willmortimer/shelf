@@ -5,6 +5,7 @@
 //! unavailable, and uses Argon2id when the caller supplies a passphrase.
 
 mod enroll;
+mod platform;
 mod vault;
 
 pub use enroll::{ShelfGrant, ShelfJoin, approve_join, export_join, import_grant};
@@ -288,6 +289,9 @@ fn create_wrap_key(
         return Ok((key, Custody::Passphrase));
     }
     let key: [u8; 32] = rand::random();
+    if platform::store_wrap_key(home, &key)? {
+        return Ok((key, Custody::Platform));
+    }
     let path = wrap_key_path(home);
     let mut f = fs::File::create(&path)?;
     f.write_all(&key)?;
@@ -305,6 +309,9 @@ fn load_wrap_key(
 ) -> Result<([u8; 32], Custody), KeystoreError> {
     if let Some(pass) = passphrase {
         return Ok((argon2_key(pass, home)?, Custody::Passphrase));
+    }
+    if let Some(key) = platform::load_wrap_key(home)? {
+        return Ok((key, Custody::Platform));
     }
     let bytes = fs::read(wrap_key_path(home))?;
     let key: [u8; 32] = bytes
@@ -398,7 +405,7 @@ mod tests {
     fn init_and_reload_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let ks = DeviceKeystore::open_or_init(dir.path(), Some("testdev"), None).unwrap();
-        assert_eq!(ks.custody(), Custody::File);
+        assert!(matches!(ks.custody(), Custody::File | Custody::Platform));
         let id = ks.public_identity().device_id;
         let wrapped = ks.wrap_secret(b"epoch-key-material-32-bytes!!").unwrap();
         drop(ks);

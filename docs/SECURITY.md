@@ -80,6 +80,16 @@ Fallback     passphrase-protected recovery material
 
 Exportable raw private identity keys should not be written to `~/.shelf/` when a platform keystore can hold or wrap them.
 
+Current wrap-key providers (identity secrets stay wrapped under the wrap key):
+
+```text
+macOS     Keychain generic password (`shelf.wrap-key`)
+Linux     Secret Service via `secret-tool`
+Windows   DPAPI blob `wrap.dpapi` (TPM-backed when the OS is)
+File      `wrap.key` mode 0600
+Passphrase Argon2id
+```
+
 ## User presence
 
 Normal synchronization should not require biometric approval for every operation.

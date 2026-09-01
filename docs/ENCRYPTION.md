@@ -34,6 +34,16 @@ X25519 + ML-KEM-768
 
 The exact wire construction must be selected from a well-reviewed library/provider rather than improvised.
 
+## Wrap-key custody
+
+The 32-byte device wrap key protects identity secrets and the vault epoch key. Load/create order:
+
+1. `--passphrase` → Argon2id (salt in `wrap.salt`)
+2. Platform store: macOS Keychain (`security`), Linux Secret Service (`secret-tool`), Windows DPAPI (`wrap.dpapi`)
+3. `~/.shelf/wrap.key` with mode 0600
+
+Windows DPAPI is the TPM-adjacent path when the OS binds the user logon to a TPM. There is no separate PKCS#11 / `tpm2-tss` provider yet.
+
 ## Vault epochs
 
 A Shelf vault has a current epoch secret.

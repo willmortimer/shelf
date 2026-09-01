@@ -282,11 +282,13 @@ trait DeviceKeyProvider {
 Providers:
 
 ```text
-Apple Secure Enclave / Keychain
-Windows TPM / CNG
-Linux TPM2 + Secret Service as appropriate
-Kage provider
-Passphrase/recovery fallback
+Apple Keychain (`security` generic password; wrap key)
+Windows DPAPI (`wrap.dpapi`; TPM-backed when the OS is)
+Linux Secret Service (`secret-tool`)
+0600 `wrap.key` file fallback
+Argon2id passphrase fallback
 ```
+
+Identity signing/KEM secrets remain wrapped under that wrap key. TPM PKCS#11 / `tpm2-tss` is not a separate provider yet.
 
 Only non-secret configuration, encrypted material, and state should be placed in `~/.shelf/`.
