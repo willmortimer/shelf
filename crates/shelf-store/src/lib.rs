@@ -1880,6 +1880,7 @@ mod tests {
             epoch: store.epoch(),
             certificates: vec![],
             mailbox_bindings: vec![],
+            routing_hints: vec![],
             snapshot_signature: shelf_core::SignatureBytes::from_bytes([0; 64]),
         };
         store.save_membership_snapshot(&snap).unwrap();
