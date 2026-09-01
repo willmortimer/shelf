@@ -22,8 +22,8 @@ pub enum ClientError {
     /// Socket I/O failed (connect, read, or write).
     #[error(transparent)]
     Io(#[from] io::Error),
-    /// Unix domain sockets are not available on this OS (Windows stub).
-    #[error("Unix domain sockets are not supported on this operating system")]
+    /// Local IPC is not available on this OS.
+    #[error("local IPC is not supported on this operating system")]
     UnsupportedOs,
 }
 

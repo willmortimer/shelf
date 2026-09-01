@@ -22,7 +22,8 @@ shelf/
 │   ├── shelf-transport/     # Tailscale, LAN, mailbox
 │   ├── shelf-keystore/      # Apple, Windows, Linux, Kage (+ passphrase fallback)
 │   ├── shelf-protocol/      # wire/storage envelopes
-│   └── shelf-client/        # local IPC client used by CLI/GUI/adapters
+│   ├── shelf-client/        # local IPC client used by CLI/GUI/adapters
+│   └── shelf-mobile/       # in-process vault for iOS (no daemon)
 │
 ├── apps/
 │   ├── shelfd/              # per-user daemon / replica engine

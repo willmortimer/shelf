@@ -4330,6 +4330,7 @@ name = "shelf-keystore"
 version = "0.0.0"
 dependencies = [
  "argon2",
+ "blake3",
  "chacha20poly1305",
  "ed25519-dalek",
  "ml-kem",
@@ -4341,6 +4342,7 @@ dependencies = [
  "shelf-store",
  "tempfile",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "zeroize",
 ]
@@ -4355,6 +4357,17 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+]
+
+[[package]]
+name = "shelf-mobile"
+version = "0.0.0"
+dependencies = [
+ "shelf-core",
+ "shelf-keystore",
+ "shelf-store",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4414,6 +4427,7 @@ dependencies = [
  "shelf-protocol",
  "shelf-store",
  "shelf-transport",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

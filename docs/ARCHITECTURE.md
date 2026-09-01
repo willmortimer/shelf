@@ -62,7 +62,10 @@ Clients include:
 
 ### iOS
 
-Because iOS does not allow a permanent arbitrary user daemon, the same core libraries should be embedded directly in the app and extension/App Intent targets where feasible. Replication is opportunistic and triggered by foreground/background opportunities permitted by the platform.
+Because iOS does not allow a permanent arbitrary user daemon, the same core
+libraries are embedded in-process via `crates/shelf-mobile` (`MobileSession`).
+Share Sheet and App Intent stubs live in `apps/shelf-ios/` (not a Cargo
+member). Replication is opportunistic when the app or extension is running.
 
 ## Crate structure
 
@@ -93,7 +96,8 @@ crates/
 │   └── kage/
 │
 ├── shelf-protocol/
-└── shelf-client/
+├── shelf-client/
+└── shelf-mobile/        # in-process vault for iOS (no daemon)
 ```
 
 Applications:

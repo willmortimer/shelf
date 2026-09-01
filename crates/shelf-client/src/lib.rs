@@ -1,8 +1,7 @@
 //! Local IPC client used by the CLI, GUI, and adapters.
 //!
-//! Speaks newline-delimited JSON to `shelfd` over a Unix domain socket.
-//! See [`ipc`] for the request/response contract. Windows named pipes are
-//! not implemented: APIs return [`ClientError::UnsupportedOs`].
+//! Speaks newline-delimited JSON to `shelfd` over a Unix domain socket
+//! or a Windows named pipe. See [`ipc`] for the request/response contract.
 
 #![deny(missing_docs)]
 

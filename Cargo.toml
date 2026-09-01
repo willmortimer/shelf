@@ -10,6 +10,7 @@ members = [
     "apps/shelfd",
     "apps/shelf-cli",
     "apps/shelf-desktop",
+    "crates/shelf-mobile",
     "services/shelf-mailbox",
 ]
 

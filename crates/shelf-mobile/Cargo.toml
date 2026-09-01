@@ -1,0 +1,15 @@
+[package]
+name = "shelf-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+shelf-core.workspace = true
+shelf-keystore.workspace = true
+shelf-store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

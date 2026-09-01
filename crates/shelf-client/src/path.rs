@@ -24,9 +24,23 @@ pub fn default_shelf_home() -> PathBuf {
 }
 
 /// Socket path inside a Shelf home: `<home>/runtime/shelfd.sock`.
+///
+/// On Windows this is a named pipe `\\.\pipe\shelf-<hash>` derived from `home`.
 #[must_use]
 pub fn socket_path_in(home: &Path) -> PathBuf {
-    home.join(RUNTIME_DIR_NAME).join(SOCKET_FILE_NAME)
+    #[cfg(windows)]
+    {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in home.to_string_lossy().bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        PathBuf::from(format!(r"\\.\pipe\shelf-{h:016x}"))
+    }
+    #[cfg(not(windows))]
+    {
+        home.join(RUNTIME_DIR_NAME).join(SOCKET_FILE_NAME)
+    }
 }
 
 /// Production default socket: `$SHELF_HOME/runtime/shelfd.sock` or
@@ -58,6 +72,7 @@ pub fn resolve_shelf_home(home: Option<PathBuf>) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
     #[test]
     fn socket_path_in_appends_runtime_sock() {
         let p = socket_path_in(Path::new("/var/shelf-home"));
@@ -67,6 +82,14 @@ mod tests {
                 .join(RUNTIME_DIR_NAME)
                 .join(SOCKET_FILE_NAME)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn socket_path_in_is_named_pipe() {
+        let p = socket_path_in(Path::new(r"C:\Users\x\.shelf"));
+        let s = p.to_string_lossy();
+        assert!(s.starts_with(r"\\.\pipe\shelf-"), "{s}");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use shelf_core::{ContentKind, ObjectId};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::ClientError;
@@ -20,8 +20,8 @@ impl Client {
     /// Connect to a running daemon at `path`.
     ///
     /// The socket is opened to verify the daemon is reachable, then dropped.
-    /// Subsequent calls reconnect. On non-Unix platforms this returns
-    /// [`ClientError::UnsupportedOs`].
+    /// Subsequent calls reconnect. On platforms other than Unix and Windows
+    /// this returns [`ClientError::UnsupportedOs`].
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let path = path.as_ref().to_path_buf();
         probe(&path).await?;
@@ -193,24 +193,24 @@ impl Client {
 }
 
 async fn probe(path: &Path) -> Result<(), ClientError> {
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err(ClientError::UnsupportedOs)
-    }
     #[cfg(unix)]
     {
         let _ = tokio::net::UnixStream::connect(path).await?;
         Ok(())
     }
+    #[cfg(windows)]
+    {
+        let _ = open_windows_pipe(path)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(ClientError::UnsupportedOs)
+    }
 }
 
 async fn rpc(path: &Path, req: &IpcRequest) -> Result<IpcResponse, ClientError> {
-    #[cfg(not(unix))]
-    {
-        let _ = (path, req);
-        Err(ClientError::UnsupportedOs)
-    }
     #[cfg(unix)]
     {
         let stream = tokio::net::UnixStream::connect(path).await?;
@@ -229,4 +229,33 @@ async fn rpc(path: &Path, req: &IpcRequest) -> Result<IpcResponse, ClientError> 
         }
         serde_json::from_str(line.trim_end()).map_err(|e| ClientError::Decode(e.to_string()))
     }
+    #[cfg(windows)]
+    {
+        let mut stream = open_windows_pipe(path)?;
+        let mut json =
+            serde_json::to_string(req).map_err(|e| ClientError::Protocol(e.to_string()))?;
+        json.push('\n');
+        stream.write_all(json.as_bytes()).await?;
+        stream.flush().await?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Err(ClientError::Protocol("empty response from daemon".into()));
+        }
+        serde_json::from_str(line.trim_end()).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, req);
+        Err(ClientError::UnsupportedOs)
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_pipe(
+    path: &Path,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, ClientError> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    Ok(ClientOptions::new().open(path)?)
 }
