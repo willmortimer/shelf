@@ -46,6 +46,5 @@ async fn run() -> Result<(), DaemonError> {
     let socket = resolve_socket_path(args.socket, args.home)?;
     let passphrase = read_passphrase(args.passphrase_fd)?;
     let vault = open_or_create_vault(&home, None, passphrase.as_deref(), args.allow_file_key)?;
-    let signer = vault.keys.device_signer();
-    serve_with_replica(socket, vault.store, home, signer).await
+    serve_with_replica(socket, vault.store, home, vault.keys).await
 }

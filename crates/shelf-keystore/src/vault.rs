@@ -184,7 +184,15 @@ pub fn revoke_device(
         .map_err(|e| KeystoreError::Identity(e.to_string()))?
         .map(|s| s.generation.saturating_add(1))
         .unwrap_or(1);
-    let snapshot = sign_snapshot(vault, &root, remaining, generation, None, Some(device_id))?;
+    let snapshot = sign_snapshot(
+        &vault.keys,
+        &vault.store,
+        &root,
+        remaining,
+        generation,
+        None,
+        Some(device_id),
+    )?;
     vault
         .store
         .save_membership_snapshot(&snapshot)

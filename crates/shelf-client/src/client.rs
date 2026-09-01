@@ -49,14 +49,7 @@ impl Client {
         match rpc(&self.path, &req).await? {
             IpcResponse::Put { id, created } => Ok(PutResult { id, created }),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Ls { .. }
-            | IpcResponse::Latest { .. }
-            | IpcResponse::Get { .. }
-            | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. }
-            | IpcResponse::Scratch { .. } => {
-                Err(ClientError::Protocol("unexpected response for put".into()))
-            }
+            _ => Err(unexpected("put")),
         }
     }
 
@@ -75,14 +68,7 @@ impl Client {
         match rpc(&self.path, &req).await? {
             IpcResponse::Put { id, created } => Ok(PutResult { id, created }),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Ls { .. }
-            | IpcResponse::Latest { .. }
-            | IpcResponse::Get { .. }
-            | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. }
-            | IpcResponse::Scratch { .. } => Err(ClientError::Protocol(
-                "unexpected response for put_file".into(),
-            )),
+            _ => Err(unexpected("put_file")),
         }
     }
 
@@ -91,14 +77,7 @@ impl Client {
         match rpc(&self.path, &IpcRequest::Ls).await? {
             IpcResponse::Ls { items } => Ok(items),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. }
-            | IpcResponse::Latest { .. }
-            | IpcResponse::Get { .. }
-            | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. }
-            | IpcResponse::Scratch { .. } => {
-                Err(ClientError::Protocol("unexpected response for ls".into()))
-            }
+            _ => Err(unexpected("ls")),
         }
     }
 
@@ -109,14 +88,7 @@ impl Client {
                 Ok(ObjectPayload::from_parts(id, kind, bytes))
             }
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. }
-            | IpcResponse::Ls { .. }
-            | IpcResponse::Get { .. }
-            | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. }
-            | IpcResponse::Scratch { .. } => Err(ClientError::Protocol(
-                "unexpected response for latest".into(),
-            )),
+            _ => Err(unexpected("latest")),
         }
     }
 
@@ -125,14 +97,7 @@ impl Client {
         match rpc(&self.path, &IpcRequest::Get { target }).await? {
             IpcResponse::Get { id, kind, bytes } => Ok(ObjectPayload::from_parts(id, kind, bytes)),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. }
-            | IpcResponse::Ls { .. }
-            | IpcResponse::Latest { .. }
-            | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. }
-            | IpcResponse::Scratch { .. } => {
-                Err(ClientError::Protocol("unexpected response for get".into()))
-            }
+            _ => Err(unexpected("get")),
         }
     }
 
@@ -143,14 +108,7 @@ impl Client {
         match rpc(&self.path, &IpcRequest::Pin { target }).await? {
             IpcResponse::Pin { id } => Ok(id),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. }
-            | IpcResponse::Ls { .. }
-            | IpcResponse::Latest { .. }
-            | IpcResponse::Get { .. }
-            | IpcResponse::Rm { .. }
-            | IpcResponse::Scratch { .. } => {
-                Err(ClientError::Protocol("unexpected response for pin".into()))
-            }
+            _ => Err(unexpected("pin")),
         }
     }
 
@@ -159,14 +117,7 @@ impl Client {
         match rpc(&self.path, &IpcRequest::Rm { target }).await? {
             IpcResponse::Rm { id } => Ok(id),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. }
-            | IpcResponse::Ls { .. }
-            | IpcResponse::Latest { .. }
-            | IpcResponse::Get { .. }
-            | IpcResponse::Pin { .. }
-            | IpcResponse::Scratch { .. } => {
-                Err(ClientError::Protocol("unexpected response for rm".into()))
-            }
+            _ => Err(unexpected("rm")),
         }
     }
 
@@ -182,14 +133,7 @@ impl Client {
         {
             IpcResponse::Scratch { text, .. } => Ok(text),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. }
-            | IpcResponse::Ls { .. }
-            | IpcResponse::Latest { .. }
-            | IpcResponse::Get { .. }
-            | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. } => Err(ClientError::Protocol(
-                "unexpected response for scratch get".into(),
-            )),
+            _ => Err(unexpected("scratch get")),
         }
     }
 
@@ -206,16 +150,55 @@ impl Client {
         {
             IpcResponse::Scratch { text, .. } => Ok(text),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. }
-            | IpcResponse::Ls { .. }
-            | IpcResponse::Latest { .. }
-            | IpcResponse::Get { .. }
-            | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. } => Err(ClientError::Protocol(
-                "unexpected response for scratch append".into(),
-            )),
+            _ => Err(unexpected("scratch append")),
         }
     }
+
+    /// Export a `.shelfjoin` from the daemon vault.
+    pub async fn enroll_export(&self) -> Result<(serde_json::Value, String), ClientError> {
+        match rpc(&self.path, &IpcRequest::EnrollExport).await? {
+            IpcResponse::EnrollExport { join, sas } => Ok((join, sas)),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("enroll export")),
+        }
+    }
+
+    /// Approve a `.shelfjoin` using the daemon vault.
+    pub async fn enroll_approve(
+        &self,
+        join: serde_json::Value,
+    ) -> Result<(serde_json::Value, String), ClientError> {
+        match rpc(&self.path, &IpcRequest::EnrollApprove { join }).await? {
+            IpcResponse::EnrollApprove { grant, sas } => Ok((grant, sas)),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("enroll approve")),
+        }
+    }
+
+    /// Import a `.shelfgrant` into the daemon vault.
+    pub async fn enroll_import(
+        &self,
+        grant: serde_json::Value,
+        expect_sas: &str,
+    ) -> Result<(), ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::EnrollImport {
+                grant,
+                expect_sas: expect_sas.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::EnrollImport => Ok(()),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("enroll import")),
+        }
+    }
+}
+
+fn unexpected(op: &str) -> ClientError {
+    ClientError::Protocol(format!("unexpected response for {op}"))
 }
 
 async fn probe(path: &Path) -> Result<(), ClientError> {

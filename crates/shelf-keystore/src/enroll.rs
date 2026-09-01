@@ -13,6 +13,9 @@ use shelf_core::{
 };
 use shelf_protocol::{sas_display, unwrap_epoch_key, wrap_epoch_key};
 
+use shelf_store::SqliteStore;
+
+use crate::DeviceKeystore;
 use crate::KeystoreError;
 use crate::vault::Vault;
 
@@ -55,7 +58,7 @@ pub fn ensure_local_root(vault: &mut Vault) -> Result<VaultRoot, KeystoreError> 
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     let request_hash = genesis_request_hash(&root, id.device_id);
     let cert = sign_certificate(
-        vault,
+        &vault.keys,
         &root,
         MembershipCertificate {
             vault_id: root.vault_id,
@@ -82,7 +85,7 @@ pub fn ensure_local_root(vault: &mut Vault) -> Result<VaultRoot, KeystoreError> 
         .store
         .put_member(&cert)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    let snapshot = sign_snapshot(vault, &root, vec![cert], 1, None, None)?;
+    let snapshot = sign_snapshot(&vault.keys, &vault.store, &root, vec![cert], 1, None, None)?;
     vault
         .store
         .save_membership_snapshot(&snapshot)
@@ -96,12 +99,21 @@ pub fn ensure_local_root(vault: &mut Vault) -> Result<VaultRoot, KeystoreError> 
 /// optional `lan_address` in the vault home `config.toml`.
 pub fn export_join(
     vault: &Vault,
+    hints: Vec<TransportHint>,
+) -> Result<(ShelfJoin, String), KeystoreError> {
+    export_join_store(&vault.keys, &vault.store, hints)
+}
+
+/// Export a `.shelfjoin` from an already-open store and keystore.
+pub fn export_join_store(
+    keys: &DeviceKeystore,
+    store: &SqliteStore,
     mut hints: Vec<TransportHint>,
 ) -> Result<(ShelfJoin, String), KeystoreError> {
     if hints.is_empty() {
-        hints = collect_local_transport_hints(vault);
+        hints = collect_local_transport_hints(keys.home());
     }
-    let id = vault.keys.public_identity();
+    let id = keys.public_identity();
     let nonce: [u8; 32] = rand::random();
     let expires_at =
         Timestamp::from_millis(Timestamp::now().as_millis().saturating_add(86_400_000));
@@ -116,20 +128,17 @@ pub fn export_join(
         capabilities: DeviceCapabilities::default(),
         nonce,
         expires_at,
-        mailbox_id: vault
-            .store
+        mailbox_id: store
             .mailbox_id()
             .map_err(|e| KeystoreError::Identity(e.to_string()))?,
-        mailbox_write_cap: vault
-            .store
+        mailbox_write_cap: store
             .mailbox_write_cap()
             .map_err(|e| KeystoreError::Identity(e.to_string()))?,
         self_signature: SignatureBytes::from_bytes([0; 64]),
     };
     let body = req.transcript();
-    req.self_signature = SignatureBytes::from_bytes(vault.keys.sign(body.as_bytes()));
-    vault
-        .store
+    req.self_signature = SignatureBytes::from_bytes(keys.sign(body.as_bytes()));
+    store
         .save_pending_request_hash(&body.hash())
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     let join = ShelfJoin {
@@ -145,13 +154,21 @@ pub fn approve_join(
     vault: &Vault,
     join: &ShelfJoin,
 ) -> Result<(ShelfGrant, String), KeystoreError> {
+    approve_join_store(&vault.keys, &vault.store, join)
+}
+
+/// Approve a join request using an already-open store and keystore.
+pub fn approve_join_store(
+    keys: &DeviceKeystore,
+    store: &SqliteStore,
+    join: &ShelfJoin,
+) -> Result<(ShelfGrant, String), KeystoreError> {
     verify_join(join)?;
-    let root = vault
-        .store
+    let root = store
         .vault_root()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?
         .ok_or_else(|| KeystoreError::Signature("vault has no root".into()))?;
-    let issuer_id = vault.keys.public_identity();
+    let issuer_id = keys.public_identity();
     if issuer_id.signing_pubkey != root.root_signing_pubkey {
         return Err(KeystoreError::Signature(
             "only the vault root device may issue grants".into(),
@@ -166,8 +183,8 @@ pub fn approve_join(
         kem_pubkey: join.request.kem_pubkey.clone(),
         role: MemberRole::Member,
         capabilities: join.request.capabilities.clone(),
-        serial: next_serial(vault)?,
-        epoch: vault.store.epoch(),
+        serial: next_serial(store)?,
+        epoch: store.epoch(),
         issuer: issuer_id.device_id,
         issuer_signing_pubkey: issuer_id.signing_pubkey,
         issued_at: Timestamp::now(),
@@ -175,29 +192,25 @@ pub fn approve_join(
         request_hash,
         issuer_signature: SignatureBytes::from_bytes([0; 64]),
     };
-    cert = sign_certificate(vault, &root, cert)?;
-    vault
-        .store
+    cert = sign_certificate(keys, &root, cert)?;
+    store
         .put_member(&cert)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    let members = vault
-        .store
+    let members = store
         .members()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    let generation = vault
-        .store
+    let generation = store
         .membership_snapshot()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?
         .map(|s| s.generation.saturating_add(1))
         .unwrap_or(2);
-    let snapshot = sign_snapshot(vault, &root, members, generation, Some(join), None)?;
-    vault
-        .store
+    let snapshot = sign_snapshot(keys, store, &root, members, generation, Some(join), None)?;
+    store
         .save_membership_snapshot(&snapshot)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     let wrap_aad = wrap_aad(&root, &cert, request_hash);
     let wrap = wrap_epoch_key(
-        vault.store.epoch_key().as_bytes(),
+        store.epoch_key().as_bytes(),
         &join.request.kem_pubkey,
         &wrap_aad,
     )
@@ -227,13 +240,23 @@ pub fn import_grant(
     grant: &ShelfGrant,
     expected_sas: &str,
 ) -> Result<(), KeystoreError> {
+    import_grant_store(&vault.keys, &mut vault.store, grant, expected_sas)
+}
+
+/// Import a grant into an already-open store and keystore.
+pub fn import_grant_store(
+    keys: &DeviceKeystore,
+    store: &mut SqliteStore,
+    grant: &ShelfGrant,
+    expected_sas: &str,
+) -> Result<(), KeystoreError> {
     let actual = grant_sas(&grant.grant)?;
     if !sas_eq(expected_sas, &actual) {
         return Err(KeystoreError::Signature(
             "SAS does not match --expect-sas / confirmation".into(),
         ));
     }
-    verify_grant(vault, grant)?;
+    verify_grant(keys, store, grant)?;
     let wrap: shelf_protocol::HybridEpochWrap =
         serde_json::from_slice(grant.grant.key_envelope.as_bytes())
             .map_err(|e| KeystoreError::Identity(e.to_string()))?;
@@ -244,40 +267,34 @@ pub fn import_grant(
     );
     let epoch = unwrap_epoch_key(
         &wrap,
-        vault.keys.x25519_secret(),
-        vault.keys.ml_kem_decapsulation_key(),
+        keys.x25519_secret(),
+        keys.ml_kem_decapsulation_key(),
         &wrap_aad,
     )
     .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    let wrapped = vault.keys.wrap_secret(&epoch)?;
-    vault
-        .store
+    let wrapped = keys.wrap_secret(&epoch)?;
+    store
         .save_vault_root(&grant.grant.vault_root)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     for cert in &grant.grant.snapshot.certificates {
-        vault
-            .store
+        store
             .put_member(cert)
             .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     }
-    vault
-        .store
+    store
         .adopt_membership(
             shelf_protocol::EpochKey::from_bytes(epoch),
             grant.grant.certificate.epoch,
             grant.grant.certificate.vault_id,
         )
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    vault
-        .store
+    store
         .save_wrapped_epoch_key(&wrapped)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    vault
-        .store
+    store
         .save_membership_snapshot(&grant.grant.snapshot)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    vault
-        .store
+    store
         .clear_pending_request_hash()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     Ok(())
@@ -317,9 +334,8 @@ fn genesis_request_hash(root: &VaultRoot, device_id: shelf_core::DeviceId) -> [u
     t.hash()
 }
 
-fn next_serial(vault: &Vault) -> Result<u64, KeystoreError> {
-    let members = vault
-        .store
+fn next_serial(store: &SqliteStore) -> Result<u64, KeystoreError> {
+    let members = store
         .members()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     Ok(members
@@ -331,20 +347,20 @@ fn next_serial(vault: &Vault) -> Result<u64, KeystoreError> {
 }
 
 pub(crate) fn sign_snapshot(
-    vault: &Vault,
+    keys: &DeviceKeystore,
+    store: &SqliteStore,
     root: &VaultRoot,
     certificates: Vec<MembershipCertificate>,
     generation: u64,
     join: Option<&ShelfJoin>,
     exclude: Option<shelf_core::DeviceId>,
 ) -> Result<MembershipSnapshot, KeystoreError> {
-    let mut mailbox_bindings = vault
-        .store
+    let mut mailbox_bindings = store
         .membership_snapshot()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?
         .map(|s| s.mailbox_bindings)
         .unwrap_or_default();
-    mailbox_bindings.extend(mailbox_bindings_local(vault)?);
+    mailbox_bindings.extend(mailbox_bindings_local(keys, store)?);
     if let Some(join) = join
         && !join.request.mailbox_id.is_empty()
     {
@@ -359,13 +375,12 @@ pub(crate) fn sign_snapshot(
     if let Some(id) = exclude {
         mailbox_bindings.retain(|b| b.device_id != id);
     }
-    let mut routing_hints = vault
-        .store
+    let mut routing_hints = store
         .membership_snapshot()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?
         .map(|s| s.routing_hints)
         .unwrap_or_default();
-    routing_hints.extend(routing_hints_local(vault));
+    routing_hints.extend(routing_hints_local(keys));
     if let Some(join) = join
         && !join.request.transport_hints.is_empty()
     {
@@ -382,31 +397,31 @@ pub(crate) fn sign_snapshot(
     let mut snapshot = MembershipSnapshot {
         vault_root: root.clone(),
         generation,
-        epoch: vault.store.epoch(),
+        epoch: store.epoch(),
         certificates,
         mailbox_bindings,
         routing_hints,
         snapshot_signature: SignatureBytes::from_bytes([0; 64]),
     };
     let body = snapshot.transcript();
-    snapshot.snapshot_signature = SignatureBytes::from_bytes(vault.keys.sign(body.as_bytes()));
+    snapshot.snapshot_signature = SignatureBytes::from_bytes(keys.sign(body.as_bytes()));
     Ok(snapshot)
 }
 
-fn routing_hints_local(vault: &Vault) -> Vec<RoutingBinding> {
-    let hints = collect_local_transport_hints(vault);
+fn routing_hints_local(keys: &DeviceKeystore) -> Vec<RoutingBinding> {
+    let hints = collect_local_transport_hints(keys.home());
     if hints.is_empty() {
         return Vec::new();
     }
     vec![RoutingBinding {
-        device_id: vault.keys.public_identity().device_id,
+        device_id: keys.public_identity().device_id,
         hints,
     }]
 }
 
-fn collect_local_transport_hints(vault: &Vault) -> Vec<TransportHint> {
+fn collect_local_transport_hints(home: &std::path::Path) -> Vec<TransportHint> {
     let mut hints = tailscale_self_hints();
-    if let Some(lan) = lan_hint_from_home(vault.keys.home()) {
+    if let Some(lan) = lan_hint_from_home(home) {
         hints.push(lan);
     }
     hints
@@ -481,34 +496,35 @@ fn lan_hint_from_home(home: &std::path::Path) -> Option<TransportHint> {
     None
 }
 
-fn mailbox_bindings_local(vault: &Vault) -> Result<Vec<MailboxBinding>, KeystoreError> {
-    let mid = vault
-        .store
+fn mailbox_bindings_local(
+    keys: &DeviceKeystore,
+    store: &SqliteStore,
+) -> Result<Vec<MailboxBinding>, KeystoreError> {
+    let mid = store
         .mailbox_id()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-    let write = vault
-        .store
+    let write = store
         .mailbox_write_cap()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     Ok(vec![MailboxBinding {
-        device_id: vault.keys.public_identity().device_id,
+        device_id: keys.public_identity().device_id,
         mailbox_id: mid,
         write_cap: write,
     }])
 }
 
 fn sign_certificate(
-    vault: &Vault,
+    keys: &DeviceKeystore,
     root: &VaultRoot,
     mut cert: MembershipCertificate,
 ) -> Result<MembershipCertificate, KeystoreError> {
-    if vault.keys.public_identity().signing_pubkey != root.root_signing_pubkey {
+    if keys.public_identity().signing_pubkey != root.root_signing_pubkey {
         return Err(KeystoreError::Signature(
             "cannot sign a certificate without the vault root key".into(),
         ));
     }
     let body = cert.transcript();
-    cert.issuer_signature = SignatureBytes::from_bytes(vault.keys.sign(body.as_bytes()));
+    cert.issuer_signature = SignatureBytes::from_bytes(keys.sign(body.as_bytes()));
     Ok(cert)
 }
 
@@ -525,9 +541,13 @@ fn verify_join(join: &ShelfJoin) -> Result<(), KeystoreError> {
     )
 }
 
-fn verify_grant(vault: &Vault, grant: &ShelfGrant) -> Result<(), KeystoreError> {
+fn verify_grant(
+    keys: &DeviceKeystore,
+    store: &SqliteStore,
+    grant: &ShelfGrant,
+) -> Result<(), KeystoreError> {
     let cert = &grant.grant.certificate;
-    let local = vault.keys.public_identity();
+    let local = keys.public_identity();
     if cert.device_id != local.device_id {
         return Err(KeystoreError::Signature(
             "grant is not for this device".into(),
@@ -538,8 +558,7 @@ fn verify_grant(vault: &Vault, grant: &ShelfGrant) -> Result<(), KeystoreError> 
             "grant signing key does not match this device".into(),
         ));
     }
-    let pending = vault
-        .store
+    let pending = store
         .pending_request_hash()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?
         .ok_or_else(|| {

@@ -241,15 +241,12 @@ Shelf supports a two-file offline flow:
 Joining machine:
 
 ```bash
-# Stop shelfd first. File enrollment opens state.db directly and cannot
-# share it with a running daemon until enroll is an IPC operation.
 shelf enroll export --out optiprox3.shelfjoin
 ```
 
 Trusted machine:
 
 ```bash
-# Stop shelfd on this machine too before approve/import.
 shelf enroll approve --join optiprox3.shelfjoin --out optiprox3.shelfgrant
 ```
 
@@ -259,10 +256,11 @@ Joining machine:
 shelf enroll import --grant optiprox3.shelfgrant
 ```
 
-`shelf enroll` refuses if it can connect to `shelfd` on the same `--home` /
-`--socket`. Requests and grants are Ed25519-signed; a tampered `.shelfjoin`
-is rejected. Import persists the grant's vault id and epoch, not only the
-wrapped epoch key.
+When `shelfd` is running on the same `--home` / `--socket`, `shelf enroll`
+goes through local IPC against the daemon's open vault. When the daemon is
+down, the CLI opens `state.db` directly. Requests and grants are
+Ed25519-signed; a tampered `.shelfjoin` is rejected. Import persists the
+grant's vault id and epoch, not only the wrapped epoch key.
 
 This works without Tailscale, LAN, a mailbox, or simultaneous connectivity.
 
