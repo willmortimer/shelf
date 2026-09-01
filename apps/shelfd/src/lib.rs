@@ -2,7 +2,7 @@
 //!
 //! Listens on a Unix domain socket and serves newline-delimited JSON IPC
 //! defined by [`shelf_client`]. Objects are sealed before they are stored.
-//! Enrollment runs through IPC when the daemon is up.
+//! Enrollment and recovery export run through IPC when the daemon is up.
 
 #![deny(missing_docs)]
 

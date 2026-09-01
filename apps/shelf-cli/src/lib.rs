@@ -14,8 +14,8 @@ use shelf_client::{
 };
 use shelf_core::{ContentKind, ObjectId};
 use shelf_keystore::{
-    KeystoreError, ShelfGrant, ShelfJoin, approve_join, export_join, grant_sas, import_grant,
-    open_or_create_vault,
+    KeystoreError, RecoveryBundle, ShelfGrant, ShelfJoin, apply_recovery, approve_join,
+    export_join, export_recovery, grant_sas, import_grant, open_or_create_vault,
 };
 use thiserror::Error;
 
@@ -137,6 +137,12 @@ pub enum Command {
     },
     /// Put the current system clipboard (explicit capture, not surveillance).
     Capture,
+    /// Export or apply a passphrase-wrapped recovery bundle.
+    Recovery {
+        /// Recovery action.
+        #[command(subcommand)]
+        action: RecoveryAction,
+    },
 }
 
 /// Offline enrollment subcommands.
@@ -168,6 +174,26 @@ pub enum EnrollAction {
     },
 }
 
+/// Recovery subcommands. Bundle passphrase is TTY or `SHELF_RECOVERY_PASSPHRASE`.
+#[derive(Debug, Subcommand)]
+pub enum RecoveryAction {
+    /// Write a `.shelfrecovery` for the vault root.
+    Export {
+        /// Output path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Restore a vault onto an empty `--home`.
+    Apply {
+        /// Recovery bundle path.
+        #[arg(long)]
+        from: PathBuf,
+        /// Allow 0600 `wrap.key` for the restored identity if the platform store is unavailable.
+        #[arg(long)]
+        allow_file_key: bool,
+    },
+}
+
 /// Execute a parsed `shelf` invocation.
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     let home = resolve_shelf_home(cli.home.clone())?;
@@ -187,6 +213,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Rm { target } => cmd_rm(&socket, &target).await,
         Command::Scratch { name, append } => cmd_scratch(&socket, &name, append).await,
         Command::Capture => cmd_capture(&socket).await,
+        Command::Recovery { action } => cmd_recovery(&home, &socket, action).await,
     }
 }
 
@@ -268,6 +295,111 @@ fn cmd_enroll_direct(home: &Path, action: EnrollAction) -> Result<(), CliError> 
             import_grant(&mut vault, &grant, &confirmed)?;
             writeln!(io::stderr(), "imported grant")?;
             Ok(())
+        }
+    }
+}
+
+async fn cmd_recovery(home: &Path, socket: &Path, action: RecoveryAction) -> Result<(), CliError> {
+    match action {
+        RecoveryAction::Export { out } => {
+            let passphrase = read_recovery_passphrase()?;
+            if Client::connect(socket).await.is_ok() {
+                let client = Client::connect(socket).await?;
+                let bundle = client.recovery_export(&passphrase).await?;
+                fs::write(&out, serde_json::to_vec_pretty(&bundle)?)?;
+            } else {
+                let vault = open_or_create_vault(home, None, None, false)?;
+                let bundle = export_recovery(&vault, &passphrase)?;
+                fs::write(&out, serde_json::to_vec_pretty(&bundle)?)?;
+            }
+            writeln!(io::stderr(), "wrote {}", out.display())?;
+            Ok(())
+        }
+        RecoveryAction::Apply {
+            from,
+            allow_file_key,
+        } => {
+            // Apply always opens `--home` directly. A running daemon belongs to
+            // another vault and must not receive this bundle.
+            let passphrase = read_recovery_passphrase()?;
+            let body = fs::read(&from)?;
+            let bundle: RecoveryBundle = serde_json::from_slice(&body)?;
+            apply_recovery(home, &bundle, &passphrase, None, allow_file_key)?;
+            writeln!(io::stderr(), "applied recovery to {}", home.display())?;
+            Ok(())
+        }
+    }
+}
+
+/// Recovery-bundle passphrase: hidden TTY, else `SHELF_RECOVERY_PASSPHRASE`.
+fn read_recovery_passphrase() -> Result<String, CliError> {
+    if let Ok(pass) = std::env::var("SHELF_RECOVERY_PASSPHRASE") {
+        let pass = pass.trim_end_matches(['\n', '\r']).to_owned();
+        if !pass.is_empty() {
+            return Ok(pass);
+        }
+    }
+    #[cfg(unix)]
+    if io::stdin().is_terminal() {
+        return read_hidden_recovery_tty();
+    }
+    Err(CliError::Usage(
+        "set SHELF_RECOVERY_PASSPHRASE or run on a TTY".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn read_hidden_recovery_tty() -> Result<String, CliError> {
+    eprint!("Recovery passphrase: ");
+    io::stderr().flush()?;
+    let line = {
+        let _echo = DisableEcho::new()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        line
+    };
+    eprintln!();
+    let trimmed = line.trim_end_matches(['\n', '\r']).to_owned();
+    if trimmed.is_empty() {
+        return Err(CliError::Usage("empty recovery passphrase".into()));
+    }
+    Ok(trimmed)
+}
+
+/// Disables stdin echo and restores it on drop (including panic unwind).
+#[cfg(unix)]
+struct DisableEcho {
+    fd: libc::c_int,
+    saved: libc::termios,
+}
+
+#[cfg(unix)]
+impl DisableEcho {
+    fn new() -> io::Result<Self> {
+        let fd = libc::STDIN_FILENO;
+        let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `fd` is stdin; `tcgetattr` writes a full `termios` on success.
+        if unsafe { libc::tcgetattr(fd, saved.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `tcgetattr` succeeded, so `saved` is initialized.
+        let saved = unsafe { saved.assume_init() };
+        let mut silent = saved;
+        silent.c_lflag &= !libc::ECHO;
+        // SAFETY: `silent` is a copy of the attributes we just read from this fd.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &silent) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd, saved })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DisableEcho {
+    fn drop(&mut self) {
+        // SAFETY: `saved` came from `tcgetattr` on this fd in `new`.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
         }
     }
 }

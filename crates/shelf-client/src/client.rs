@@ -195,6 +195,48 @@ impl Client {
             _ => Err(unexpected("enroll import")),
         }
     }
+
+    /// Export a `.shelfrecovery` from the daemon vault.
+    pub async fn recovery_export(
+        &self,
+        passphrase: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::RecoveryExport {
+                passphrase: passphrase.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::RecoveryExport { bundle } => Ok(bundle),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("recovery export")),
+        }
+    }
+
+    /// Apply a recovery bundle through the daemon.
+    ///
+    /// The CLI never calls this: apply is local against an empty `--home`.
+    pub async fn recovery_apply(
+        &self,
+        bundle: serde_json::Value,
+        passphrase: &str,
+    ) -> Result<(), ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::RecoveryApply {
+                bundle,
+                passphrase: passphrase.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::RecoveryApply => Ok(()),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("recovery apply")),
+        }
+    }
 }
 
 fn unexpected(op: &str) -> ClientError {

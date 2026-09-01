@@ -113,6 +113,7 @@ shelf/metadata/v1
 shelf/enrollment/v1
 shelf/membership/v1
 shelf/search/v1
+shelf/recovery/v1
 ```
 
 Do not reuse raw root material across different cryptographic purposes.
@@ -233,19 +234,31 @@ No unencrypted private key files.
 
 ## Recovery
 
-Recovery material should be a separate explicitly generated artifact, never an automatic plaintext backup of device private keys.
+Recovery material is a separate explicitly generated artifact, never an automatic plaintext backup of device private keys.
 
-Possible model:
+v1 bundle (`shelf/recovery/v1`, file extension `.shelfrecovery`):
 
 ```text
-RecoveryRoot
+RecoveryRoot (vault root identity secrets
+              + current epoch key
+              + membership snapshot
+              + sealed object envelopes)
    ↓
-wrap current vault bootstrap/recovery secret
+Argon2id (salt in the bundle) → wrap key
    ↓
-passphrase-encrypted recovery bundle
+XChaCha20-Poly1305, AAD = transcript(shelf/recovery/v1, version, vault_id)
 ```
 
-Recovery should be versioned and rotatable.
+CLI:
+
+```bash
+shelf recovery export --out vault.shelfrecovery
+shelf recovery apply --from vault.shelfrecovery
+```
+
+The bundle passphrase is a hidden TTY prompt when stdin is a TTY, otherwise `SHELF_RECOVERY_PASSPHRASE` (not argv). It is not the vault wrap-key passphrase. Apply targets an empty `--home` and is always CLI-direct so a running daemon of another vault cannot receive the bundle. Export uses local IPC when `shelfd` is up.
+
+Apply restores the existing `VaultRoot` (decrypt + v1 root-only grants). A mailbox cannot recover a vault. Recovery is versioned; Kage-managed recovery keys are out of scope for v1.
 
 ## Forward secrecy considerations
 

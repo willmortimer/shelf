@@ -149,6 +149,8 @@ shelf search kubernetes
 shelf pin 2
 shelf rm 5
 shelf scratch
+shelf recovery export --out vault.shelfrecovery
+shelf recovery apply --from vault.shelfrecovery
 ```
 
 Convenience compatibility commands may also be supplied:

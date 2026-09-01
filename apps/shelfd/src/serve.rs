@@ -17,7 +17,8 @@ use shelf_core::ContentKind;
 use shelf_keystore::DeviceKeystore;
 #[cfg(any(unix, windows))]
 use shelf_keystore::{
-    KeystoreError, ShelfGrant, ShelfJoin, approve_join_store, export_join_store, import_grant_store,
+    KeystoreError, ShelfGrant, ShelfJoin, approve_join_store, export_join_store,
+    export_recovery_store, import_grant_store,
 };
 #[cfg(any(unix, windows))]
 use shelf_store::StoreError;
@@ -288,6 +289,11 @@ fn dispatch(
         IpcRequest::EnrollImport { grant, expect_sas } => {
             enroll_import(store, keys, grant, expect_sas)
         }
+        IpcRequest::RecoveryExport { passphrase } => recovery_export(store, keys, passphrase),
+        IpcRequest::RecoveryApply { .. } => IpcResponse::Error {
+            code: IpcErrorCode::Protocol,
+            message: "recovery apply is CLI-direct against an empty home".into(),
+        },
     }
 }
 
@@ -368,6 +374,27 @@ fn enroll_needs_keystore() -> IpcResponse {
     IpcResponse::Error {
         code: IpcErrorCode::Protocol,
         message: "enroll requires an open vault".into(),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn recovery_export(
+    store: &mut MemoryStore,
+    keys: Option<&DeviceKeystore>,
+    passphrase: String,
+) -> IpcResponse {
+    let Some(keys) = keys else {
+        return enroll_needs_keystore();
+    };
+    match export_recovery_store(keys, store, &passphrase) {
+        Ok(bundle) => match serde_json::to_value(&bundle) {
+            Ok(bundle) => IpcResponse::RecoveryExport { bundle },
+            Err(err) => IpcResponse::Error {
+                code: IpcErrorCode::Protocol,
+                message: err.to_string(),
+            },
+        },
+        Err(err) => keystore_error(err),
     }
 }
 
