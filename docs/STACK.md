@@ -56,6 +56,8 @@ Invariant: `shelf-core` must not depend on `shelf-mailbox`.
 
 - Local IPC: Unix domain sockets (macOS/Linux); named pipes or local IPC (Windows).
 - Userland state root: `~/.shelf/` (`config.toml`, `state.db`, objects, chunks, logs, runtime, cache, export, enrollment).
+- `shelf init` / `shelf enroll` write identity + vault under `--home` (file wrap 0600, or Argon2id with `--passphrase`). Hardware-backed providers are the preferred custody path; this tree uses the documented file fallback until platform stores are wired.
+- Replica fan-out: host `tailscale status --json` (no tsnet), LAN UDP (`lan_port` in `config.toml`, default 18732), optional mailbox at `mailbox_url` (`host:port`). Mailbox protocol is newline JSON PUT/GET/ACK; default listen `127.0.0.1:8743`.
 - Desktop GUI must not own a second configuration tree.
 
 ## Intended dependencies (not pinned yet)

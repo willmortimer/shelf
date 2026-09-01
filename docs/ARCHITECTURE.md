@@ -201,6 +201,8 @@ GET mailbox-id
 ACK object-id
 ```
 
+The current implementation is newline-delimited JSON over TCP (`shelf-mailbox`, default `127.0.0.1:8743`). Ciphertext is Base64. The mailbox never decrypts.
+
 The exact API may additionally support chunk batching, size limits, quotas, and long-polling, but it should remain intentionally dumb.
 
 Deleting or replacing the mailbox must not alter:
