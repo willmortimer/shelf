@@ -191,6 +191,14 @@ fn unwrap_bundle(
     if passphrase.is_empty() || bundle.salt.len() < 16 {
         return Err(KeystoreError::Recovery);
     }
+    // v1 apply only accepts the export-time KDF. Attacker-chosen m/t/p would
+    // otherwise let a crafted bundle DoS apply with unbounded Argon2 memory.
+    if bundle.argon2_m_kib != ARGON2_M_KIB
+        || bundle.argon2_t != ARGON2_T
+        || bundle.argon2_p != ARGON2_P
+    {
+        return Err(KeystoreError::Recovery);
+    }
     let key = argon2_recovery_key(
         passphrase,
         &bundle.salt,
@@ -311,5 +319,20 @@ mod tests {
             Ok(_) => panic!("occupied home must fail"),
         };
         assert!(matches!(err, KeystoreError::RecoveryHomeNotEmpty));
+    }
+
+    #[test]
+    fn apply_rejects_attacker_chosen_argon2_params() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let vault = open_or_create_vault(src.path(), Some("root"), None, true).unwrap();
+        let pass = unique_passphrase();
+        let mut bundle = export_recovery(&vault, &pass).unwrap();
+        bundle.argon2_m_kib = ARGON2_M_KIB.saturating_mul(64);
+        let err = match apply_recovery(dst.path(), &bundle, &pass, None, true) {
+            Err(err) => err,
+            Ok(_) => panic!("inflated Argon2 memory must fail"),
+        };
+        assert!(matches!(err, KeystoreError::Recovery));
     }
 }
