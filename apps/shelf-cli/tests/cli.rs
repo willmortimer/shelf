@@ -281,6 +281,7 @@ fn init_export_approve_import_two_homes() {
             "init",
             "--name",
             "mac",
+            "--allow-file-key",
         ])
         .output()
         .unwrap();
@@ -293,6 +294,7 @@ fn init_export_approve_import_two_homes() {
             "init",
             "--name",
             "linux",
+            "--allow-file-key",
         ])
         .output()
         .unwrap();
@@ -329,6 +331,10 @@ fn init_export_approve_import_two_homes() {
     assert!(approve.status.success(), "{}", stderr_str(&approve));
     let sas_m = stderr_str(&approve);
     assert!(sas_m.contains("SAS:"), "{sas_m}");
+    let grant_sas = sas_m
+        .lines()
+        .find_map(|l| l.strip_prefix("SAS: "))
+        .expect("approve SAS");
 
     let import = Command::new(bin())
         .args([
@@ -338,6 +344,8 @@ fn init_export_approve_import_two_homes() {
             "import",
             "--grant",
             grant.to_str().unwrap(),
+            "--expect-sas",
+            grant_sas,
         ])
         .output()
         .unwrap();

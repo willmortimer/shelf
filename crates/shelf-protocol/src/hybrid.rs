@@ -7,9 +7,6 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::cipher::{open_xchacha, seal_xchacha};
 use crate::error::ProtocolError;
 
-/// Domain for combining hybrid shared secrets.
-const DOMAIN_ENROLL_WRAP: &str = "shelf/enrollment/v1";
-
 /// Ciphertext wrapping a 32-byte epoch key to a joining device's hybrid KEM.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HybridEpochWrap {
@@ -24,19 +21,25 @@ pub struct HybridEpochWrap {
 }
 
 /// Wrap `epoch_key` to `recipient` (joining device public hybrid KEM).
+///
+/// `aad` must bind the enrollment ceremony (request hash, vault root, etc.).
 pub fn wrap_epoch_key(
     epoch_key: &[u8; 32],
     recipient: &HybridKemPublicKey,
+    aad: &[u8],
 ) -> Result<HybridEpochWrap, ProtocolError> {
     let eph = StaticSecret::from(rand::random::<[u8; 32]>());
     let eph_pub = PublicKey::from(&eph);
     let their_x = PublicKey::from(*recipient.x25519.as_bytes());
     let x_ss = eph.diffie_hellman(&their_x);
+    if x_ss.to_bytes() == [0u8; 32] {
+        return Err(ProtocolError::WrapFailure);
+    }
 
     let (ml_ct, ml_ss) = mlkem_encapsulate(recipient.ml_kem_768.as_bytes())?;
     let wrap_key = combine(&x_ss.to_bytes(), ml_ss.as_slice());
     let nonce: [u8; 24] = rand::random();
-    let ciphertext = seal_xchacha(&wrap_key, &nonce, DOMAIN_ENROLL_WRAP.as_bytes(), epoch_key)?;
+    let ciphertext = seal_xchacha(&wrap_key, &nonce, aad, epoch_key)?;
     Ok(HybridEpochWrap {
         x25519_ephemeral: eph_pub.to_bytes(),
         ml_kem_ciphertext: ml_ct,
@@ -50,17 +53,16 @@ pub fn unwrap_epoch_key(
     wrap: &HybridEpochWrap,
     x25519_secret: &StaticSecret,
     ml_kem_seed: &[u8],
+    aad: &[u8],
 ) -> Result<[u8; 32], ProtocolError> {
     let their_eph = PublicKey::from(wrap.x25519_ephemeral);
     let x_ss = x25519_secret.diffie_hellman(&their_eph);
+    if x_ss.to_bytes() == [0u8; 32] {
+        return Err(ProtocolError::WrapFailure);
+    }
     let ml_ss = mlkem_decapsulate(ml_kem_seed, &wrap.ml_kem_ciphertext)?;
     let wrap_key = combine(&x_ss.to_bytes(), ml_ss.as_slice());
-    let pt = open_xchacha(
-        &wrap_key,
-        &wrap.nonce,
-        DOMAIN_ENROLL_WRAP.as_bytes(),
-        &wrap.ciphertext,
-    )?;
+    let pt = open_xchacha(&wrap_key, &wrap.nonce, aad, &wrap.ciphertext)?;
     pt.as_slice()
         .try_into()
         .map_err(|_| ProtocolError::InvalidDekLength {
@@ -73,7 +75,7 @@ fn combine(x: &[u8; 32], ml: &[u8]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(32 + ml.len());
     buf.extend_from_slice(x);
     buf.extend_from_slice(ml);
-    blake3::derive_key(DOMAIN_ENROLL_WRAP, &buf)
+    blake3::derive_key(shelf_core::DOMAIN_ENROLL_WRAP, &buf)
 }
 
 fn mlkem_encapsulate(ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
@@ -126,8 +128,10 @@ mod tests {
             MlKem768PublicKey::from_bytes(ek.to_bytes().to_vec()).unwrap(),
         );
         let epoch: [u8; 32] = rand::random();
-        let wrap = wrap_epoch_key(&epoch, &recipient).unwrap();
-        let opened = unwrap_epoch_key(&wrap, &x_sec, dk.to_bytes().as_slice()).unwrap();
+        let aad = b"shelf/enrollment/wrap/v1-test";
+        let wrap = wrap_epoch_key(&epoch, &recipient, aad).unwrap();
+        let opened = unwrap_epoch_key(&wrap, &x_sec, dk.to_bytes().as_slice(), aad).unwrap();
         assert_eq!(opened, epoch);
+        assert!(unwrap_epoch_key(&wrap, &x_sec, dk.to_bytes().as_slice(), b"wrong-aad").is_err());
     }
 }

@@ -18,7 +18,10 @@ pub struct Vault {
 }
 
 /// Create `~/.shelf/` layout (`config.toml`, `state.db` parent dirs, runtime).
+///
+/// Directories are created with mode 0700 on Unix.
 pub fn ensure_home_layout(home: &Path) -> Result<(), KeystoreError> {
+    create_dir_private(home)?;
     for dir in [
         "objects",
         "chunks",
@@ -28,7 +31,7 @@ pub fn ensure_home_layout(home: &Path) -> Result<(), KeystoreError> {
         "export",
         "enrollment",
     ] {
-        fs::create_dir_all(home.join(dir))?;
+        create_dir_private(&home.join(dir))?;
     }
     let cfg = home.join("config.toml");
     if !cfg.exists() {
@@ -43,17 +46,30 @@ pub fn ensure_home_layout(home: &Path) -> Result<(), KeystoreError> {
     Ok(())
 }
 
+fn create_dir_private(path: &Path) -> Result<(), KeystoreError> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Open an existing vault or create a new one under `home`.
+///
+/// `allow_file_key` is only consulted when creating a new identity.
 pub fn open_or_create_vault(
     home: impl AsRef<Path>,
     device_name: Option<&str>,
     passphrase: Option<&str>,
+    allow_file_key: bool,
 ) -> Result<Vault, KeystoreError> {
     let home = home.as_ref();
     ensure_home_layout(home)?;
-    let keys = DeviceKeystore::open_or_init(home, device_name, passphrase)?;
+    let keys = DeviceKeystore::open_or_init(home, device_name, passphrase, allow_file_key)?;
     let db = home.join("state.db");
-    let store = if let Some((device_id, epoch, vault_id, wrapped)) =
+    let mut store = if let Some((device_id, epoch, vault_id, wrapped)) =
         SqliteStore::load_identity(&db).map_err(|e| KeystoreError::Identity(e.to_string()))?
     {
         let raw = keys.unwrap_secret(&wrapped)?;
@@ -61,23 +77,67 @@ pub fn open_or_create_vault(
             .as_slice()
             .try_into()
             .map_err(|_| KeystoreError::Identity("epoch key must be 32 bytes".into()))?;
-        SqliteStore::open(&db, EpochKey::from_bytes(bytes), device_id, epoch, vault_id)
-            .map_err(|e| KeystoreError::Identity(e.to_string()))?
+        SqliteStore::open(
+            &db,
+            EpochKey::from_bytes(bytes),
+            device_id,
+            epoch,
+            vault_id,
+            &wrapped,
+        )
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?
     } else {
         let epoch_key = EpochKey::new();
         let wrapped = keys.wrap_secret(epoch_key.as_bytes())?;
-        let store = SqliteStore::open(
+        SqliteStore::open(
             &db,
             epoch_key,
             keys.public_identity().device_id,
             EpochId::new(1),
             VaultId::new(),
+            &wrapped,
         )
-        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-        store
-            .save_wrapped_epoch_key(&wrapped)
-            .map_err(|e| KeystoreError::Identity(e.to_string()))?;
-        store
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?
     };
-    Ok(Vault { keys, store })
+    load_epoch_keyring(&keys, &mut store)?;
+    let mut vault = Vault { keys, store };
+    crate::ensure_local_root(&mut vault)?;
+    Ok(vault)
+}
+
+fn load_epoch_keyring(keys: &DeviceKeystore, store: &mut SqliteStore) -> Result<(), KeystoreError> {
+    for (epoch, wrapped) in store
+        .list_epoch_wraps()
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?
+    {
+        let raw = keys.unwrap_secret(&wrapped)?;
+        let bytes: [u8; 32] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| KeystoreError::Identity("epoch key must be 32 bytes".into()))?;
+        store
+            .add_epoch_key(epoch, EpochKey::from_bytes(bytes))
+            .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Rotate the vault epoch and drop `device_id` from membership.
+///
+/// Old epoch keys remain in the local keyring so existing objects still open.
+pub fn revoke_device(
+    vault: &mut Vault,
+    device_id: shelf_core::DeviceId,
+) -> Result<EpochId, KeystoreError> {
+    let new_key = EpochKey::new();
+    let wrapped = vault.keys.wrap_secret(new_key.as_bytes())?;
+    let new_epoch = vault
+        .store
+        .revoke_device(device_id, new_key)
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    vault
+        .store
+        .save_wrapped_epoch_key(&wrapped)
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    Ok(new_epoch)
 }

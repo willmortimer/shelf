@@ -37,7 +37,13 @@ slint::slint! {
 
 #[tokio::main]
 async fn main() {
-    let socket = resolve_socket_path(None, None);
+    let socket = match resolve_socket_path(None, None) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("shelf-desktop: {err}");
+            std::process::exit(1);
+        }
+    };
     let client = match Client::connect(&socket).await {
         Ok(c) => c,
         Err(err) => {

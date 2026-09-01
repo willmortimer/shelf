@@ -109,7 +109,51 @@ pub struct EnrollmentRequest {
     pub self_signature: SignatureBytes,
 }
 
-/// Opaque ciphertext wrapping vault key material to the joiner's hybrid KEM.
+impl EnrollmentRequest {
+    /// Binary transcript with `self_signature` omitted.
+    #[must_use]
+    pub fn transcript(&self) -> crate::transcript::Transcript {
+        let mut t = crate::transcript::Transcript::new(crate::transcript::DOMAIN_ENROLL_REQUEST);
+        t.push_u16(self.protocol_version);
+        t.push_fixed(self.device_id.as_bytes());
+        t.push_bytes(self.device_name.as_bytes());
+        t.push_fixed(self.signing_pubkey.as_bytes());
+        t.push_fixed(self.kem_pubkey.x25519.as_bytes());
+        t.push_bytes(self.kem_pubkey.ml_kem_768.as_bytes());
+        t.push_fixed(self.ephemeral_pubkey.as_bytes());
+        t.push_u16(u16::try_from(self.transport_hints.len()).unwrap_or(u16::MAX));
+        for hint in &self.transport_hints {
+            match hint {
+                TransportHint::Lan { address } => {
+                    t.push_u8(1);
+                    t.push_bytes(address.as_bytes());
+                }
+                TransportHint::Tailscale { address } => {
+                    t.push_u8(2);
+                    t.push_bytes(address.as_bytes());
+                }
+                TransportHint::RendezvousToken { token } => {
+                    t.push_u8(3);
+                    t.push_bytes(token.as_bytes());
+                }
+            }
+        }
+        t.push_u8(u8::from(self.capabilities.can_approve_enrollment));
+        t.push_u8(u8::from(self.capabilities.can_issue_grants));
+        t.push_bytes(
+            self.capabilities
+                .platform
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        t.push_fixed(&self.nonce);
+        t.push_u64(self.expires_at.as_millis());
+        t
+    }
+}
+
+/// Opaque ciphertext wrapping vault key material to the joining device's hybrid KEM.
 ///
 /// This is not a mailbox object; it travels with the grant on any transport.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,6 +178,69 @@ impl std::fmt::Debug for EncryptedVaultKeyEnvelope {
         f.debug_struct("EncryptedVaultKeyEnvelope")
             .field("len", &self.0.len())
             .finish()
+    }
+}
+
+/// First-device vault authority. Grants are verified against this key, never
+/// against a public key chosen inside the certificate being verified.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultRoot {
+    /// Vault this root governs.
+    pub vault_id: VaultId,
+    /// Root signing public key (v1: the first device's signing key).
+    pub root_signing_pubkey: SigningPublicKey,
+    /// Root generation (starts at 1).
+    pub generation: u64,
+}
+
+impl VaultRoot {
+    /// Binary transcript of the root (no signature; the root is the trust anchor).
+    #[must_use]
+    pub fn transcript(&self) -> crate::transcript::Transcript {
+        let mut t = crate::transcript::Transcript::new("shelf/vault-root/v1");
+        t.push_fixed(self.vault_id.as_bytes());
+        t.push_fixed(self.root_signing_pubkey.as_bytes());
+        t.push_u64(self.generation);
+        t
+    }
+
+    /// Short hex fingerprint for CLI display (first 8 bytes of the transcript hash).
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        crate::hexutil::encode(&self.transcript().hash()[..8])
+    }
+}
+
+/// Thin membership view shipped with a grant, signed by [`VaultRoot`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipSnapshot {
+    /// Vault root this snapshot is bound to.
+    pub vault_root: VaultRoot,
+    /// Membership generation.
+    pub generation: u64,
+    /// Current vault epoch.
+    pub epoch: EpochId,
+    /// Valid member certificates (root device + joiner at minimum).
+    pub certificates: Vec<MembershipCertificate>,
+    /// Root signature over [`Self::transcript`].
+    pub snapshot_signature: SignatureBytes,
+}
+
+impl MembershipSnapshot {
+    /// Binary transcript with `snapshot_signature` omitted.
+    #[must_use]
+    pub fn transcript(&self) -> crate::transcript::Transcript {
+        let mut t = crate::transcript::Transcript::new(crate::transcript::DOMAIN_ENROLL_SNAPSHOT);
+        t.push_fixed(self.vault_root.transcript().as_bytes());
+        t.push_u64(self.generation);
+        t.push_u64(self.epoch.as_u64());
+        t.push_u16(u16::try_from(self.certificates.len()).unwrap_or(u16::MAX));
+        let mut certs = self.certificates.clone();
+        certs.sort_by(|a, b| a.device_id.as_bytes().cmp(b.device_id.as_bytes()));
+        for cert in &certs {
+            t.push_bytes(cert.transcript().as_bytes());
+        }
+        t
     }
 }
 
@@ -182,27 +289,75 @@ pub struct MembershipCertificate {
     pub serial: u64,
     /// Vault epoch at issue.
     pub epoch: EpochId,
-    /// Issuing device identity.
+    /// Issuing device identity (informational; verification uses [`VaultRoot`]).
     pub issuer: DeviceId,
-    /// Issuer signing public key (needed to verify [`Self::issuer_signature`]).
+    /// Issuer signing public key (informational; not a trust anchor).
     pub issuer_signing_pubkey: SigningPublicKey,
     /// Issue time.
     pub issued_at: Timestamp,
     /// Optional certificate expiration.
     pub expires_at: Option<Timestamp>,
+    /// Hash of the enrollment request this certificate answers.
+    #[serde(with = "crate::hexutil")]
+    pub request_hash: [u8; 32],
     /// Issuer signature over the bindings.
     pub issuer_signature: SignatureBytes,
+}
+
+impl MembershipCertificate {
+    /// Binary transcript with `issuer_signature` omitted.
+    #[must_use]
+    pub fn transcript(&self) -> crate::transcript::Transcript {
+        let mut t = crate::transcript::Transcript::new(crate::transcript::DOMAIN_ENROLL_CERT);
+        t.push_fixed(self.vault_id.as_bytes());
+        t.push_fixed(self.device_id.as_bytes());
+        t.push_fixed(self.signing_pubkey.as_bytes());
+        t.push_fixed(self.kem_pubkey.x25519.as_bytes());
+        t.push_bytes(self.kem_pubkey.ml_kem_768.as_bytes());
+        t.push_u8(match self.role {
+            MemberRole::Member => 0,
+            MemberRole::Authority => 1,
+        });
+        t.push_u8(u8::from(self.capabilities.can_approve_enrollment));
+        t.push_u8(u8::from(self.capabilities.can_issue_grants));
+        t.push_bytes(
+            self.capabilities
+                .platform
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        t.push_u64(self.serial);
+        t.push_u64(self.epoch.as_u64());
+        t.push_fixed(self.issuer.as_bytes());
+        t.push_fixed(self.issuer_signing_pubkey.as_bytes());
+        t.push_u64(self.issued_at.as_millis());
+        t.push_u8(u8::from(self.expires_at.is_some()));
+        if let Some(exp) = self.expires_at {
+            t.push_u64(exp.as_millis());
+        }
+        t.push_fixed(&self.request_hash);
+        t
+    }
 }
 
 /// Grant delivered to a joining device after approval.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipGrant {
+    /// Vault root used to authenticate this grant.
+    pub vault_root: VaultRoot,
+    /// Hash of the enrollment request this grant answers.
+    #[serde(with = "crate::hexutil")]
+    pub request_hash: [u8; 32],
+    /// Approver nonce bound into the two-way SAS.
+    #[serde(with = "crate::hexutil")]
+    pub approver_nonce: [u8; 32],
     /// Signed membership certificate.
     pub certificate: MembershipCertificate,
     /// Vault key material sealed to the joiner.
     pub key_envelope: EncryptedVaultKeyEnvelope,
-    /// Encrypted membership snapshot.
-    pub membership_snapshot: EncryptedMembershipState,
+    /// Root-signed membership snapshot.
+    pub snapshot: MembershipSnapshot,
 }
 
 /// Enrollment state machine (docs/ENROLLMENT.md).

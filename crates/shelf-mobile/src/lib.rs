@@ -31,8 +31,18 @@ pub struct MobileSession {
 
 impl MobileSession {
     /// Open or create the vault under `home` (the app's Application Support dir).
+    ///
+    /// File wrap is never used. Platform Keychain or a passphrase is required.
     pub fn open(home: impl AsRef<Path>) -> Result<Self, MobileError> {
-        let vault = open_or_create_vault(home.as_ref(), Some("ios"), None)?;
+        Self::open_with(home, None)
+    }
+
+    /// Open with an optional Argon2id passphrase (tests and recovery).
+    pub fn open_with(
+        home: impl AsRef<Path>,
+        passphrase: Option<&str>,
+    ) -> Result<Self, MobileError> {
+        let vault = open_or_create_vault(home.as_ref(), Some("ios"), passphrase, false)?;
         Ok(Self {
             vault: Mutex::new(vault),
         })
@@ -81,7 +91,7 @@ mod tests {
     #[test]
     fn put_then_latest_in_process() {
         let dir = tempfile::tempdir().unwrap();
-        let session = MobileSession::open(dir.path()).unwrap();
+        let session = MobileSession::open_with(dir.path(), Some("test-pass")).unwrap();
         let id = session.put_text("from-share-sheet").unwrap();
         assert_eq!(id.len(), 64);
         assert_eq!(session.latest().unwrap(), b"from-share-sheet");

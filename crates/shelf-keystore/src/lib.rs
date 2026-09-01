@@ -1,15 +1,17 @@
 //! Device identity secrets and wrapping of vault epoch keys.
 //!
-//! Hardware-backed custody is preferred. This crate always provides a
-//! locked-down file wrap key (`wrap.key`, mode 0600) when a platform store is
-//! unavailable, and uses Argon2id when the caller supplies a passphrase.
+//! Custody is fail-closed: platform store or `--passphrase`. File wrap
+//! (`wrap.key`, mode 0600) is only created when the caller passes
+//! `allow_file_key`. iOS never uses file wrap.
 
 mod enroll;
 mod platform;
 mod vault;
 
-pub use enroll::{ShelfGrant, ShelfJoin, approve_join, export_join, import_grant};
-pub use vault::{Vault, ensure_home_layout, open_or_create_vault};
+pub use enroll::{
+    ShelfGrant, ShelfJoin, approve_join, ensure_local_root, export_join, grant_sas, import_grant,
+};
+pub use vault::{Vault, ensure_home_layout, open_or_create_vault, revoke_device};
 
 use std::fs;
 use std::io::{self, Write};
@@ -45,6 +47,9 @@ pub enum KeystoreError {
     /// Identity bytes were not valid key material.
     #[error("invalid key material: {0}")]
     Identity(String),
+    /// No platform store, no passphrase, and file wrap is not allowed.
+    #[error("no wrap-key custody: use a platform store, --passphrase, or --allow-file-key")]
+    NoCustody,
     /// Enrollment request or grant signature was invalid or expired.
     #[error("enrollment signature: {0}")]
     Signature(String),
@@ -135,18 +140,22 @@ struct SecretBlob {
 
 impl DeviceKeystore {
     /// Create a new identity in `home` (or return the existing one).
+    ///
+    /// `allow_file_key` permits a 0600 `wrap.key` only when platform custody is
+    /// unavailable. Existing file-key vaults still load without the flag.
     pub fn open_or_init(
         home: impl AsRef<Path>,
         device_name: Option<&str>,
         passphrase: Option<&str>,
+        allow_file_key: bool,
     ) -> Result<Self, KeystoreError> {
         let home = home.as_ref().to_path_buf();
-        fs::create_dir_all(&home)?;
+        crate::vault::ensure_home_layout(&home)?;
         let id_path = home.join("identity.json");
         if id_path.exists() {
             return Self::load(&home, passphrase);
         }
-        Self::init(&home, device_name, passphrase)
+        Self::init(&home, device_name, passphrase, allow_file_key)
     }
 
     /// Load an existing identity.
@@ -158,9 +167,11 @@ impl DeviceKeystore {
         let secrets = unwrap_secrets(&wrap_key, &file.wrapped_secrets)?;
         let signing = SigningKey::from_bytes(&secrets.signing);
         let x25519 = x25519_dalek::StaticSecret::from(secrets.x25519);
+        let identity =
+            identity_from_secrets(&file.identity, &signing, &x25519, &secrets.ml_kem_dk)?;
         Ok(Self {
             home,
-            identity: file.identity,
+            identity,
             signing,
             x25519,
             ml_kem_dk: secrets.ml_kem_dk.clone(),
@@ -173,6 +184,7 @@ impl DeviceKeystore {
         home: &Path,
         device_name: Option<&str>,
         passphrase: Option<&str>,
+        allow_file_key: bool,
     ) -> Result<Self, KeystoreError> {
         let signing = SigningKey::from_bytes(&rand::random());
         let verifying: VerifyingKey = signing.verifying_key();
@@ -192,23 +204,15 @@ impl DeviceKeystore {
             x25519: x25519.to_bytes(),
             ml_kem_dk: ml_dk,
         };
-        let (wrap_key, custody) = create_wrap_key(home, passphrase)?;
+        let (wrap_key, custody) = create_wrap_key(home, passphrase, allow_file_key)?;
         let wrapped = wrap_secrets(&wrap_key, &secrets)?;
         let file = IdentityFile {
             version: 1,
             identity: identity.clone(),
             wrapped_secrets: wrapped,
         };
-        let mut f = fs::File::create(home.join("identity.json"))?;
+        let mut f = create_private_file(&home.join("identity.json"))?;
         f.write_all(serde_json::to_string_pretty(&file)?.as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                home.join("identity.json"),
-                fs::Permissions::from_mode(0o600),
-            )?;
-        }
         Ok(Self {
             home: home.to_path_buf(),
             identity,
@@ -276,30 +280,86 @@ impl DeviceKeystore {
     }
 }
 
+impl Drop for DeviceKeystore {
+    fn drop(&mut self) {
+        self.wrap_key.zeroize();
+        self.ml_kem_dk.zeroize();
+    }
+}
+
 fn wrap_key_path(home: &Path) -> PathBuf {
     home.join("wrap.key")
+}
+
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::create(path)
+    }
+}
+
+fn identity_from_secrets(
+    stored: &DevicePublicIdentity,
+    signing: &SigningKey,
+    x25519: &x25519_dalek::StaticSecret,
+    ml_kem_dk: &[u8],
+) -> Result<DevicePublicIdentity, KeystoreError> {
+    let x_pub = x25519_dalek::PublicKey::from(x25519);
+    Ok(DevicePublicIdentity::new(
+        stored.device_id,
+        SigningPublicKey::from(signing.verifying_key()),
+        X25519PublicKey::from_bytes(x_pub.to_bytes()),
+        ml_kem_ek_from_dk(ml_kem_dk)?,
+        stored.device_name.clone(),
+    ))
+}
+
+fn ml_kem_ek_from_dk(seed: &[u8]) -> Result<MlKem768PublicKey, KeystoreError> {
+    use ml_kem::kem::KeyExport;
+    use ml_kem::{DecapsulationKey, MlKem768, Seed};
+
+    if seed.len() != 64 {
+        return Err(KeystoreError::Identity(
+            "ml-kem dk must be 64-byte seed".into(),
+        ));
+    }
+    let mut seed_arr = Seed::default();
+    seed_arr.copy_from_slice(seed);
+    let dk = DecapsulationKey::<MlKem768>::from_seed(seed_arr);
+    MlKem768PublicKey::from_bytes(dk.encapsulation_key().to_bytes().to_vec())
+        .map_err(|e| KeystoreError::Identity(e.to_string()))
 }
 
 fn create_wrap_key(
     home: &Path,
     passphrase: Option<&str>,
+    allow_file_key: bool,
 ) -> Result<([u8; 32], Custody), KeystoreError> {
     if let Some(pass) = passphrase {
         let key = argon2_key(pass, home)?;
         return Ok((key, Custody::Passphrase));
     }
-    let key: [u8; 32] = rand::random();
+    let mut key: [u8; 32] = rand::random();
     if platform::store_wrap_key(home, &key)? {
         return Ok((key, Custody::Platform));
     }
-    let path = wrap_key_path(home);
-    let mut f = fs::File::create(&path)?;
-    f.write_all(&key)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    if cfg!(target_os = "ios") || !allow_file_key {
+        key.zeroize();
+        return Err(KeystoreError::NoCustody);
     }
+    let path = wrap_key_path(home);
+    let mut f = create_private_file(&path)?;
+    f.write_all(&key)?;
     Ok((key, Custody::File))
 }
 
@@ -328,7 +388,8 @@ fn argon2_key(pass: &str, home: &Path) -> Result<[u8; 32], KeystoreError> {
         fs::read(salt_path)?
     } else {
         let s: [u8; 16] = rand::random();
-        fs::write(home.join("wrap.salt"), s)?;
+        let mut f = create_private_file(&home.join("wrap.salt"))?;
+        f.write_all(&s)?;
         s.to_vec()
     };
     if salt.len() < 16 {
@@ -404,7 +465,7 @@ mod tests {
     #[test]
     fn init_and_reload_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let ks = DeviceKeystore::open_or_init(dir.path(), Some("testdev"), None).unwrap();
+        let ks = DeviceKeystore::open_or_init(dir.path(), Some("testdev"), None, true).unwrap();
         assert!(matches!(ks.custody(), Custody::File | Custody::Platform));
         let id = ks.public_identity().device_id;
         let wrapped = ks.wrap_secret(b"epoch-key-material-32-bytes!!").unwrap();
@@ -424,7 +485,8 @@ mod tests {
     #[test]
     fn passphrase_custody_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let ks = DeviceKeystore::open_or_init(dir.path(), None, Some("correct horse")).unwrap();
+        let ks =
+            DeviceKeystore::open_or_init(dir.path(), None, Some("correct horse"), false).unwrap();
         assert_eq!(ks.custody(), Custody::Passphrase);
         let blob = ks.wrap_secret(&[7u8; 32]).unwrap();
         drop(ks);
@@ -437,14 +499,25 @@ mod tests {
     fn enroll_offline_files_share_epoch() {
         let member_dir = tempfile::tempdir().unwrap();
         let join_dir = tempfile::tempdir().unwrap();
-        let mut member = crate::open_or_create_vault(member_dir.path(), Some("mac"), None).unwrap();
-        let mut joiner = crate::open_or_create_vault(join_dir.path(), Some("linux"), None).unwrap();
-        let (join, sas_a) = crate::export_join(&joiner, Vec::new()).unwrap();
-        let (grant, sas_b) = crate::approve_join(&member, &join).unwrap();
-        assert_eq!(sas_a, sas_b);
-        crate::import_grant(&mut joiner, &grant).unwrap();
+        let mut member =
+            crate::open_or_create_vault(member_dir.path(), Some("mac"), None, true).unwrap();
+        let mut joiner =
+            crate::open_or_create_vault(join_dir.path(), Some("linux"), None, true).unwrap();
+        let (join, request_sas) = crate::export_join(&joiner, Vec::new()).unwrap();
+        let (grant, grant_sas) = crate::approve_join(&member, &join).unwrap();
+        assert_ne!(request_sas, grant_sas);
+        crate::import_grant(&mut joiner, &grant, &grant_sas).unwrap();
         assert_eq!(joiner.store.vault_id(), member.store.vault_id());
         assert_eq!(joiner.store.epoch(), member.store.epoch());
+        assert!(
+            joiner
+                .store
+                .members()
+                .unwrap()
+                .iter()
+                .any(|c| c.device_id == member.keys.public_identity().device_id),
+            "joiner must import the approver certificate"
+        );
         let payload = b"from-member";
         let (id, created) = member
             .store
@@ -471,8 +544,10 @@ mod tests {
     fn approve_rejects_tampered_join_signature() {
         let member_dir = tempfile::tempdir().unwrap();
         let join_dir = tempfile::tempdir().unwrap();
-        let member = crate::open_or_create_vault(member_dir.path(), Some("mac"), None).unwrap();
-        let joiner = crate::open_or_create_vault(join_dir.path(), Some("linux"), None).unwrap();
+        let member =
+            crate::open_or_create_vault(member_dir.path(), Some("mac"), None, true).unwrap();
+        let joiner =
+            crate::open_or_create_vault(join_dir.path(), Some("linux"), None, true).unwrap();
         let (mut join, _) = crate::export_join(&joiner, Vec::new()).unwrap();
         join.request.device_name = "attacker".into();
         assert!(crate::approve_join(&member, &join).is_err());
@@ -482,11 +557,106 @@ mod tests {
     fn import_rejects_tampered_grant_signature() {
         let member_dir = tempfile::tempdir().unwrap();
         let join_dir = tempfile::tempdir().unwrap();
-        let member = crate::open_or_create_vault(member_dir.path(), Some("mac"), None).unwrap();
-        let mut joiner = crate::open_or_create_vault(join_dir.path(), Some("linux"), None).unwrap();
+        let member =
+            crate::open_or_create_vault(member_dir.path(), Some("mac"), None, true).unwrap();
+        let mut joiner =
+            crate::open_or_create_vault(join_dir.path(), Some("linux"), None, true).unwrap();
         let (join, _) = crate::export_join(&joiner, Vec::new()).unwrap();
-        let (mut grant, _) = crate::approve_join(&member, &join).unwrap();
+        let (mut grant, sas) = crate::approve_join(&member, &join).unwrap();
         grant.grant.certificate.serial = 99;
-        assert!(crate::import_grant(&mut joiner, &grant).is_err());
+        assert!(crate::import_grant(&mut joiner, &grant, &sas).is_err());
+    }
+
+    #[test]
+    fn import_rejects_wrong_sas() {
+        let member_dir = tempfile::tempdir().unwrap();
+        let join_dir = tempfile::tempdir().unwrap();
+        let member =
+            crate::open_or_create_vault(member_dir.path(), Some("mac"), None, true).unwrap();
+        let mut joiner =
+            crate::open_or_create_vault(join_dir.path(), Some("linux"), None, true).unwrap();
+        let (join, _) = crate::export_join(&joiner, Vec::new()).unwrap();
+        let (grant, _) = crate::approve_join(&member, &join).unwrap();
+        assert!(crate::import_grant(&mut joiner, &grant, "able acid acre aged aide aims").is_err());
+    }
+
+    #[test]
+    fn import_rejects_attacker_grant_when_sas_is_the_real_approver() {
+        let member_dir = tempfile::tempdir().unwrap();
+        let join_dir = tempfile::tempdir().unwrap();
+        let attacker_dir = tempfile::tempdir().unwrap();
+        let member =
+            crate::open_or_create_vault(member_dir.path(), Some("mac"), None, true).unwrap();
+        let mut joiner =
+            crate::open_or_create_vault(join_dir.path(), Some("linux"), None, true).unwrap();
+        let attacker =
+            crate::open_or_create_vault(attacker_dir.path(), Some("evil"), None, true).unwrap();
+        let (join, _) = crate::export_join(&joiner, Vec::new()).unwrap();
+        let (legitimate, sas) = crate::approve_join(&member, &join).unwrap();
+        let (hostile, hostile_sas) = crate::approve_join(&attacker, &join).unwrap();
+        assert_ne!(sas, hostile_sas);
+        assert!(crate::import_grant(&mut joiner, &hostile, &sas).is_err());
+        crate::import_grant(&mut joiner, &legitimate, &sas).unwrap();
+        assert_eq!(joiner.store.vault_id(), member.store.vault_id());
+    }
+
+    #[test]
+    fn file_key_requires_flag_when_platform_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        match DeviceKeystore::open_or_init(dir.path(), Some("x"), None, false) {
+            Ok(ks) => assert_eq!(ks.custody(), Custody::Platform),
+            Err(KeystoreError::NoCustody) => {}
+            Err(other) => panic!("unexpected {other}"),
+        }
+    }
+
+    #[test]
+    fn vault_persists_wrapped_epoch_not_raw_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = crate::open_or_create_vault(dir.path(), Some("t"), None, true).unwrap();
+        let loaded = shelf_store::SqliteStore::load_identity(&dir.path().join("state.db"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(loaded.3.as_slice(), vault.store.epoch_key().as_bytes());
+        assert!(
+            loaded.3.len() > 32,
+            "wrapped blob should be nonce+ciphertext, not 32 raw bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_layout_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("shelf");
+        let _ = crate::open_or_create_vault(&home, Some("t"), None, true).unwrap();
+        let mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let runtime = std::fs::metadata(home.join("runtime"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(runtime, 0o700);
+    }
+
+    #[test]
+    fn revoke_keeps_old_epoch_key_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = crate::open_or_create_vault(dir.path(), Some("t"), None, true).unwrap();
+        let old_epoch = vault.store.epoch();
+        let victim = shelf_core::DeviceId::new();
+        let new_epoch = crate::revoke_device(&mut vault, victim).unwrap();
+        assert!(new_epoch > old_epoch);
+        assert_eq!(vault.store.epoch(), new_epoch);
+        assert!(vault.store.key_for(old_epoch).is_ok());
+        assert!(vault.store.key_for(new_epoch).is_ok());
+        drop(vault);
+        let reopened = crate::open_or_create_vault(dir.path(), Some("t"), None, true).unwrap();
+        assert!(reopened.store.key_for(old_epoch).is_ok());
+        assert!(reopened.store.key_for(new_epoch).is_ok());
+        assert_eq!(reopened.store.epoch(), new_epoch);
     }
 }

@@ -4,7 +4,7 @@
 //! helpers can be unit-tested without spawning a process.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
@@ -14,7 +14,7 @@ use shelf_client::{
 };
 use shelf_core::{ContentKind, ObjectId};
 use shelf_keystore::{
-    KeystoreError, ShelfGrant, ShelfJoin, approve_join, export_join, import_grant,
+    KeystoreError, ShelfGrant, ShelfJoin, approve_join, export_join, grant_sas, import_grant,
     open_or_create_vault,
 };
 use thiserror::Error;
@@ -75,9 +75,12 @@ pub enum Command {
         /// Human-readable device name.
         #[arg(long)]
         name: Option<String>,
-        /// Optional wrap passphrase (Argon2id). File 0600 wrap is used otherwise.
+        /// Optional wrap passphrase (Argon2id).
         #[arg(long)]
         passphrase: Option<String>,
+        /// Allow 0600 `wrap.key` if the platform store is unavailable (unsafe).
+        #[arg(long)]
+        allow_file_key: bool,
     },
     /// Offline enrollment via `.shelfjoin` / `.shelfgrant` files.
     Enroll {
@@ -159,15 +162,22 @@ pub enum EnrollAction {
         /// Grant file.
         #[arg(long)]
         grant: PathBuf,
+        /// Expected two-way SAS (required when stdin is not a TTY).
+        #[arg(long)]
+        expect_sas: Option<String>,
     },
 }
 
 /// Execute a parsed `shelf` invocation.
 pub async fn run(cli: Cli) -> Result<(), CliError> {
-    let home = resolve_shelf_home(cli.home.clone());
-    let socket = resolve_socket_path(cli.socket, cli.home);
+    let home = resolve_shelf_home(cli.home.clone())?;
+    let socket = resolve_socket_path(cli.socket, cli.home)?;
     match cli.command {
-        Command::Init { name, passphrase } => cmd_init(&home, name, passphrase),
+        Command::Init {
+            name,
+            passphrase,
+            allow_file_key,
+        } => cmd_init(&home, name, passphrase, allow_file_key),
         Command::Enroll { action } => cmd_enroll(&home, &socket, action),
         Command::Put { name, kind, file } => cmd_put(&socket, name, kind, file).await,
         Command::Latest => cmd_latest(&socket).await,
@@ -180,8 +190,13 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
-fn cmd_init(home: &Path, name: Option<String>, passphrase: Option<String>) -> Result<(), CliError> {
-    let vault = open_or_create_vault(home, name.as_deref(), passphrase.as_deref())?;
+fn cmd_init(
+    home: &Path,
+    name: Option<String>,
+    passphrase: Option<String>,
+    allow_file_key: bool,
+) -> Result<(), CliError> {
+    let vault = open_or_create_vault(home, name.as_deref(), passphrase.as_deref(), allow_file_key)?;
     writeln!(io::stdout(), "{}", vault.keys.public_identity().device_id)?;
     Ok(())
 }
@@ -190,7 +205,7 @@ fn cmd_enroll(home: &Path, socket: &Path, action: EnrollAction) -> Result<(), Cl
     refuse_if_daemon_running(socket)?;
     match action {
         EnrollAction::Export { out } => {
-            let vault = open_or_create_vault(home, None, None)?;
+            let vault = open_or_create_vault(home, None, None, false)?;
             let (join, sas) = export_join(&vault, Vec::new())?;
             fs::write(&out, serde_json::to_vec_pretty(&join)?)?;
             writeln!(io::stderr(), "SAS: {sas}")?;
@@ -198,7 +213,7 @@ fn cmd_enroll(home: &Path, socket: &Path, action: EnrollAction) -> Result<(), Cl
             Ok(())
         }
         EnrollAction::Approve { join, out } => {
-            let vault = open_or_create_vault(home, None, None)?;
+            let vault = open_or_create_vault(home, None, None, false)?;
             let body = fs::read(&join)?;
             let join: ShelfJoin = serde_json::from_slice(&body)?;
             let (grant, sas) = approve_join(&vault, &join)?;
@@ -207,11 +222,34 @@ fn cmd_enroll(home: &Path, socket: &Path, action: EnrollAction) -> Result<(), Cl
             writeln!(io::stderr(), "wrote {}", out.display())?;
             Ok(())
         }
-        EnrollAction::Import { grant } => {
-            let mut vault = open_or_create_vault(home, None, None)?;
+        EnrollAction::Import { grant, expect_sas } => {
+            let mut vault = open_or_create_vault(home, None, None, false)?;
             let body = fs::read(&grant)?;
             let grant: ShelfGrant = serde_json::from_slice(&body)?;
-            import_grant(&mut vault, &grant)?;
+            let sas = grant_sas(&grant.grant)?;
+            writeln!(
+                io::stderr(),
+                "Vault: {}\nApprover: {}\nSAS: {sas}",
+                grant.grant.vault_root.fingerprint(),
+                grant.grant.certificate.issuer
+            )?;
+            let confirmed = if let Some(expect) = expect_sas {
+                expect
+            } else if io::stdin().is_terminal() {
+                eprint!("Confirm SAS matches trusted device? [y/N] ");
+                io::stderr().flush()?;
+                let mut line = String::new();
+                io::stdin().read_line(&mut line)?;
+                if !line.trim().eq_ignore_ascii_case("y") {
+                    return Err(CliError::Usage("enrollment import cancelled".into()));
+                }
+                sas.clone()
+            } else {
+                return Err(CliError::Usage(
+                    "pass --expect-sas when stdin is not a TTY".into(),
+                ));
+            };
+            import_grant(&mut vault, &grant, &confirmed)?;
             writeln!(io::stderr(), "imported grant")?;
             Ok(())
         }
@@ -517,6 +555,9 @@ mod tests {
                 | ContentKind::OpaqueBytes => {
                     assert_eq!(parse_kind(kind.as_wire_str()).unwrap(), kind);
                 }
+                ContentKind::Scratch => {
+                    assert!(parse_kind("scratch").is_err());
+                }
             }
         }
         check(ContentKind::Text);
@@ -526,6 +567,7 @@ mod tests {
         check(ContentKind::File);
         check(ContentKind::Json);
         check(ContentKind::OpaqueBytes);
+        check(ContentKind::Scratch);
     }
 
     #[test]

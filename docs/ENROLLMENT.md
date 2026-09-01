@@ -24,6 +24,8 @@ shelf init
 
 or the equivalent GUI action generates a new device identity locally.
 
+Custody is fail-closed: platform store or `--passphrase`. Use `--allow-file-key` only when you accept a 0600 `wrap.key`. iOS never uses file wrap.
+
 Conceptual state:
 
 ```text
@@ -84,12 +86,24 @@ falcon velvet lunar
 
 The fingerprint should bind:
 
-- joining ephemeral key,
-- approving device ephemeral key,
-- request nonce,
-- protocol context.
+- request hash,
+- vault root,
+- issuer identity,
+- grant hash (certificate + envelope + snapshot),
+- approver nonce.
 
-It exists so a human can detect active network substitution even when the transport is hostile.
+The joining device must confirm the **grant SAS** (two-way). Offline CLI:
+
+```bash
+shelf enroll import foo.shelfgrant --expect-sas "velvet luna cactus marble"
+```
+
+or, on a TTY, confirm the printed SAS matches the trusted device. Import verifies
+the certificate and snapshot under [`VaultRoot`], not a public key chosen inside
+the grant. The first device is the vault root (its signing key). Only that device
+may issue grants in this version.
+
+## Membership grant
 
 ## Approval
 
@@ -113,11 +127,19 @@ The approving device creates:
 
 ```rust
 struct MembershipGrant {
+    vault_root: VaultRoot,
+    request_hash: EnrollmentRequestHash,
+    approver_nonce: [u8; 32],
     certificate: MembershipCertificate,
     key_envelope: EncryptedVaultKeyEnvelope,
-    membership_snapshot: EncryptedMembershipState,
+    snapshot: MembershipSnapshot,
 }
 ```
+
+`VaultRoot` is created at `shelf init` on the first device. A membership certificate
+never establishes the key used to authenticate itself. Signatures use
+length-prefixed binary transcripts, not JSON. The hybrid wrap AAD binds the
+request hash, vault root, joiner keys, and certificate hash.
 
 The membership certificate binds:
 

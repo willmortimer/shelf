@@ -1,6 +1,6 @@
 //! Platform wrap-key custody: Keychain, Secret Service, DPAPI.
 //!
-//! Failures are non-fatal: the caller falls back to a 0600 `wrap.key` file.
+//! Failures are non-fatal: the caller may fall back to `--allow-file-key`.
 
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
