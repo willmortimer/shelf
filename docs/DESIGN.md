@@ -99,7 +99,7 @@ Cmd/Ctrl + Shift + V
 
 opens a searchable recent-item palette.
 
-Selecting an item copies it into the system clipboard and closes the palette. The user then uses the normal paste shortcut.
+`shelf-desktop` is that palette. Bind the OS global shortcut to the `shelf-desktop` binary (the app does not register a hotkey crate; that keeps CI and Wayland simple). Type to filter by kind or id. Click, or press Return on a match, copies the item into the system clipboard and closes the palette. The user then uses the normal paste shortcut.
 
 This avoids depending on cross-platform synthetic keystroke injection, especially on Wayland.
 
@@ -182,6 +182,8 @@ App Intent → Fetch Latest Shelf Item
 ```
 
 This enables use from the Action Button, Control Center, Siri, Spotlight, Back Tap, and Shortcuts without requiring continuous clipboard monitoring.
+
+There is no always-on `shelfd` on iOS. `crates/shelf-mobile` opens the vault in-process; Swift Share Sheet / App Intent stubs in `apps/shelf-ios/` are the intended call sites.
 
 ## File transfer
 

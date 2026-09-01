@@ -56,9 +56,10 @@ Invariant: `shelf-core` must not depend on `shelf-mailbox`.
 
 - Local IPC: Unix domain sockets (macOS/Linux); named pipes or local IPC (Windows).
 - Userland state root: `~/.shelf/` (`config.toml`, `state.db`, objects, chunks, logs, runtime, cache, export, enrollment).
-- `shelf init` / `shelf enroll` write identity + vault under `--home` (file wrap 0600, or Argon2id with `--passphrase`). Hardware-backed providers are the preferred custody path; this tree uses the documented file fallback until platform stores are wired.
-- Replica fan-out: host `tailscale status --json` (no tsnet), LAN UDP (`lan_port` in `config.toml`, default 18732), optional mailbox at `mailbox_url` (`host:port`). Mailbox protocol is newline JSON PUT/GET/ACK; default listen `127.0.0.1:8743`.
-- Desktop GUI must not own a second configuration tree.
+- `shelf init` / `shelf enroll` write identity + vault under `--home` (file wrap 0600, or Argon2id with `--passphrase`). Platform custody is tried first: macOS Keychain (`security`), Linux Secret Service (`secret-tool`), Windows DPAPI (`wrap.dpapi`). File 0600 remains the fallback. `shelf enroll` must not run while `shelfd` holds `state.db`.
+- Replica fan-out: host `tailscale status --json` (no tsnet), framed TCP peer sessions on `peer_port` (default 18733), LAN UDP (`lan_port`, default 18732), optional mailbox at `mailbox_url`. Put/pin/rm notify the replica immediately; signed pin/tombstone frames keep two daemons consistent. Mailbox protocol is newline JSON PUT/GET/ACK; default listen `127.0.0.1:8743`.
+- Desktop GUI must not own a second configuration tree. `shelf-desktop` is a searchable palette (copy-on-select). Bind an OS keyboard shortcut to the `shelf-desktop` binary for a global hotkey.
+- iOS: `crates/shelf-mobile` in-process session; Swift stubs in `apps/shelf-ios/` (not a Cargo member). Windows IPC: named pipes `\\.\pipe\shelf-<hash>`.
 
 ## Intended dependencies (not pinned yet)
 

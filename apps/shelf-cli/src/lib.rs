@@ -352,26 +352,71 @@ pub fn write_clipboard(bytes: &[u8]) -> Result<(), CliError> {
     Ok(())
 }
 
+const LINUX_PASTE: &[(&str, &[&str])] = &[
+    ("wl-paste", &["--no-newline"]),
+    ("xclip", &["-selection", "clipboard", "-o"]),
+    ("xsel", &["--clipboard", "--output"]),
+];
+
+const LINUX_COPY: &[(&str, &[&str])] = &[
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard", "-i"]),
+    ("xsel", &["--clipboard", "--input"]),
+];
+
 fn clipboard_paste_command() -> Option<ProcessCommand> {
     if cfg!(target_os = "macos") {
-        Some(ProcessCommand::new("pbpaste"))
-    } else if cfg!(target_os = "linux") {
-        let mut cmd = ProcessCommand::new("wl-paste");
-        cmd.arg("--no-newline");
-        Some(cmd)
-    } else {
-        None
+        return Some(ProcessCommand::new("pbpaste"));
     }
+    if cfg!(target_os = "linux") {
+        for (bin, args) in LINUX_PASTE {
+            if command_exists(bin) {
+                let mut cmd = ProcessCommand::new(bin);
+                cmd.args(*args);
+                return Some(cmd);
+            }
+        }
+    }
+    if cfg!(windows) {
+        let mut cmd = ProcessCommand::new("powershell");
+        cmd.args(["-NoProfile", "-Command", "Get-Clipboard -Raw"]);
+        return Some(cmd);
+    }
+    None
 }
 
 fn clipboard_copy_command() -> Option<ProcessCommand> {
     if cfg!(target_os = "macos") {
-        Some(ProcessCommand::new("pbcopy"))
-    } else if cfg!(target_os = "linux") {
-        Some(ProcessCommand::new("wl-copy"))
-    } else {
-        None
+        return Some(ProcessCommand::new("pbcopy"));
     }
+    if cfg!(target_os = "linux") {
+        for (bin, args) in LINUX_COPY {
+            if command_exists(bin) {
+                let mut cmd = ProcessCommand::new(bin);
+                cmd.args(*args);
+                return Some(cmd);
+            }
+        }
+    }
+    if cfg!(windows) {
+        return Some(ProcessCommand::new("clip"));
+    }
+    None
+}
+
+fn command_exists(name: &str) -> bool {
+    which_ok(name)
+}
+
+fn which_ok(name: &str) -> bool {
+    ProcessCommand::new("which")
+        .arg(name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn write_stdout(bytes: &[u8]) -> Result<(), CliError> {
@@ -516,5 +561,17 @@ mod tests {
         let pinned_line = format_ls_line(&pinned);
         assert!(pinned_line.ends_with(" pinned"));
         assert!(pinned_line.contains(&item.id.to_string()));
+    }
+
+    #[test]
+    fn linux_clipboard_falls_back_past_wl_paste() {
+        assert_eq!(
+            LINUX_PASTE.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+            vec!["wl-paste", "xclip", "xsel"]
+        );
+        assert_eq!(
+            LINUX_COPY.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+            vec!["wl-copy", "xclip", "xsel"]
+        );
     }
 }

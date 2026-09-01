@@ -1,23 +1,31 @@
 //! `shelf-desktop` binary: searchable recent-item palette.
 
 use shelf_client::{Client, GetTarget, resolve_socket_path};
-use shelf_desktop::format_line;
+use shelf_desktop::{copy_clipboard, filter_lines, format_line};
 use std::rc::Rc;
 
 slint::slint! {
-    import { Button, VerticalBox } from "std-widgets.slint";
+    import { Button, VerticalBox, LineEdit } from "std-widgets.slint";
 
     export component Palette inherits Window {
         title: "Shelf";
-        min-width: 420px;
-        min-height: 280px;
+        min-width: 480px;
+        min-height: 320px;
         in-out property <[string]> lines: [];
+        in-out property <string> query: "";
         callback pick(int);
+        callback query-changed(string);
         VerticalBox {
             padding: 8px;
-            spacing: 4px;
+            spacing: 6px;
             Text {
-                text: "Select an item to copy. Close when done.";
+                text: "Type to search. Click (or press Return on a match) to copy.";
+            }
+            LineEdit {
+                text <=> query;
+                placeholder-text: "Search kind or id";
+                edited => { query-changed(self.text); }
+                accepted => { pick(0); }
             }
             for line[i] in lines: Button {
                 text: line;
@@ -34,6 +42,7 @@ async fn main() {
         Ok(c) => c,
         Err(err) => {
             eprintln!("shelf-desktop: {err}");
+            eprintln!("Start shelfd, then run shelf-desktop again.");
             std::process::exit(1);
         }
     };
@@ -44,20 +53,44 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let lines: Vec<slint::SharedString> = items
+    let all_lines: Vec<String> = items
         .iter()
-        .map(|item| {
-            slint::SharedString::from(format_line(item.kind.as_wire_str(), &item.id.to_string()))
-        })
+        .map(|item| format_line(item.kind.as_wire_str(), &item.id.to_string()))
         .collect();
 
     let ui = Palette::new().expect("palette");
-    let model = Rc::new(slint::VecModel::from(lines));
-    ui.set_lines(model.into());
+    let visible = filter_lines(&all_lines, "");
+    let model = Rc::new(slint::VecModel::from(
+        visible
+            .iter()
+            .map(|(_, l)| slint::SharedString::from(l.as_str()))
+            .collect::<Vec<_>>(),
+    ));
+    ui.set_lines(model.clone().into());
+
+    let all = all_lines.clone();
+    let model_q = model.clone();
+    ui.on_query_changed(move |q| {
+        let hits = filter_lines(&all, &q);
+        model_q.set_vec(
+            hits.iter()
+                .map(|(_, l)| slint::SharedString::from(l.as_str()))
+                .collect::<Vec<_>>(),
+        );
+    });
 
     let ui_weak = ui.as_weak();
+    let all_for_pick = all_lines;
     ui.on_pick(move |index| {
-        let idx = u64::try_from(index).unwrap_or(0).saturating_add(1);
+        let q = ui_weak
+            .upgrade()
+            .map(|u| u.get_query().to_string())
+            .unwrap_or_default();
+        let hits = filter_lines(&all_for_pick, &q);
+        let Some(&(orig, _)) = hits.get(usize::try_from(index).unwrap_or(0)) else {
+            return;
+        };
+        let idx = u64::try_from(orig).unwrap_or(0).saturating_add(1);
         let socket = socket.clone();
         let result = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -84,29 +117,6 @@ async fn main() {
         }
     });
 
+    eprintln!("Bind your OS shortcut (macOS: System Settings > Keyboard) to `shelf-desktop`.");
     ui.run().expect("run palette");
-}
-
-fn copy_clipboard(bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut cmd = if cfg!(target_os = "macos") {
-        Command::new("pbcopy")
-    } else if cfg!(target_os = "linux") {
-        Command::new("wl-copy")
-    } else {
-        return Err("no clipboard tool on this platform".into());
-    };
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(bytes).map_err(|e| e.to_string())?;
-    }
-    let status = child.wait().map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("clipboard copy failed".into())
-    }
 }
