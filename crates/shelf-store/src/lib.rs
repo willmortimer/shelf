@@ -945,16 +945,33 @@ impl SqliteStore {
     }
 
     /// Sealed scratch envelopes for replica (never raw Yrs).
+    ///
+    /// Returns every persist envelope in insert order so coalesced replica
+    /// wakes still record each edit. Vaults that predate the outbox fall back
+    /// to the latest pad envelope.
     pub fn export_scratch(&self) -> Result<Vec<EncryptedObject>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT envelope FROM scratch_pads")?;
-        let rows = stmt.query_map([], |row| {
-            let json: String = row.get(0)?;
-            Ok(json)
-        })?;
         let mut out = Vec::new();
-        for row in rows {
-            let json = row?;
-            out.push(serde_json::from_str(&json)?);
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT envelope FROM scratch_envelopes ORDER BY rowid ASC")?;
+            let rows = stmt.query_map([], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })?;
+            for row in rows {
+                out.push(serde_json::from_str(&row?)?);
+            }
+        }
+        if out.is_empty() {
+            let mut stmt = self.conn.prepare("SELECT envelope FROM scratch_pads")?;
+            let rows = stmt.query_map([], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })?;
+            for row in rows {
+                out.push(serde_json::from_str(&row?)?);
+            }
         }
         Ok(out)
     }
@@ -1137,16 +1154,18 @@ impl SqliteStore {
 
     fn load_scratch(&self, name: &str) -> Result<ScratchPad, StoreError> {
         let id = scratch_id_for(&self.scratch_index_key()?, name);
-        let json: Option<String> = self
+        let sealed: Option<(Option<String>, String)> = self
             .conn
             .query_row(
-                "SELECT envelope FROM scratch_pads WHERE scratch_id = ?1",
+                "SELECT snapshot, envelope FROM scratch_pads WHERE scratch_id = ?1",
                 params![id.as_bytes().as_slice()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let mut pad = ScratchPad::new(name);
-        if let Some(json) = json {
+        if let Some((snapshot, envelope)) = sealed {
+            // Snapshot is the sealed full document; envelope may be a diff.
+            let json = snapshot.unwrap_or(envelope);
             let env: EncryptedObject = serde_json::from_str(&json)?;
             let pt = self.open_env(&env)?;
             if pt.content_kind != ContentKind::Scratch {
@@ -1163,10 +1182,58 @@ impl SqliteStore {
 
     fn persist_scratch(&self, name: &str, pad: &ScratchPad) -> Result<(), StoreError> {
         let id = scratch_id_for(&self.scratch_index_key()?, name);
-        let body = encode_scratch_body(name, &pad.encode_update());
-        let object_id = ObjectId::from_bytes(*id.as_bytes());
-        let env = seal_named(
-            &body,
+        let last_sv = self.last_scratch_sv(id.as_bytes())?;
+        let update = match last_sv.as_deref() {
+            Some(sv) => pad.encode_diff_from(sv),
+            None => pad.encode_update(),
+        };
+        let env = self.seal_scratch(name, id.as_bytes(), &encode_scratch_body(name, &update))?;
+        let json = serde_json::to_string(&env)?;
+        // Local reload needs the merged document; the export envelope may be a diff.
+        let snapshot_json = if last_sv.is_some() {
+            let full = self.seal_scratch(
+                name,
+                id.as_bytes(),
+                &encode_scratch_body(name, &pad.encode_update()),
+            )?;
+            serde_json::to_string(&full)?
+        } else {
+            json.clone()
+        };
+        let sv = pad.state_vector();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scratch_pads(scratch_id, envelope, snapshot, state_vector)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id.as_bytes().as_slice(), json, snapshot_json, sv],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO scratch_envelopes(ciphertext_hash, envelope) VALUES (?1, ?2)",
+            params![env.ciphertext_hash.as_bytes().as_slice(), json],
+        )?;
+        Ok(())
+    }
+
+    fn last_scratch_sv(&self, scratch_id: &[u8; 32]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT state_vector FROM scratch_pads WHERE scratch_id = ?1",
+                params![scratch_id.as_slice()],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    fn seal_scratch(
+        &self,
+        name: &str,
+        scratch_id: &[u8; 32],
+        body: &[u8],
+    ) -> Result<EncryptedObject, StoreError> {
+        let object_id = ObjectId::from_bytes(*scratch_id);
+        Ok(seal_named(
+            body,
             object_id,
             self.epoch,
             &self.epoch_key,
@@ -1174,13 +1241,7 @@ impl SqliteStore {
             self.device_id,
             Some(name),
             Some(self.hlc.last()),
-        )?;
-        let json = serde_json::to_string(&env)?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO scratch_pads(scratch_id, envelope) VALUES (?1, ?2)",
-            params![id.as_bytes().as_slice(), json],
-        )?;
-        Ok(())
+        )?)
     }
 
     fn insert_row(&self, row: StoredRow) -> Result<(), StoreError> {
@@ -1406,6 +1467,12 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
          );
          CREATE TABLE IF NOT EXISTS scratch_pads (
            scratch_id BLOB PRIMARY KEY,
+           envelope TEXT NOT NULL,
+           snapshot TEXT,
+           state_vector BLOB
+         );
+         CREATE TABLE IF NOT EXISTS scratch_envelopes (
+           ciphertext_hash BLOB PRIMARY KEY,
            envelope TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS members (
@@ -1432,6 +1499,8 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
     )?;
     let _ = conn.execute("ALTER TABLE chunks ADD COLUMN parent BLOB", []);
     let _ = conn.execute("ALTER TABLE chunks ADD COLUMN expires_at INTEGER", []);
+    let _ = conn.execute("ALTER TABLE scratch_pads ADD COLUMN snapshot TEXT", []);
+    let _ = conn.execute("ALTER TABLE scratch_pads ADD COLUMN state_vector BLOB", []);
     let _ = conn.execute("ALTER TABLE ops ADD COLUMN dedupe TEXT", []);
     let _ = conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ops_dedupe ON ops(dedupe) WHERE dedupe IS NOT NULL",
@@ -1719,6 +1788,73 @@ mod tests {
         };
         b.ingest_scratch_envelope(env).unwrap();
         assert_eq!(b.scratch_text("Scratch").unwrap(), "hello ");
+    }
+
+    fn open_peer_store(a: &SqliteStore) -> (tempfile::TempDir, SqliteStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(
+            &dir.path().join("state.db"),
+            shelf_protocol::EpochKey::from_bytes(*a.epoch_key().as_bytes()),
+            DeviceId::new(),
+            a.epoch(),
+            a.vault_id(),
+            &[0xEE; 32],
+        )
+        .unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn scratch_append_second_edit_is_diff_and_merges() {
+        let mut a = SqliteStore::memory();
+        a.scratch_append("Scratch", "hello ").unwrap();
+        let env1 = a.scratch_envelope("Scratch").unwrap().unwrap();
+        a.scratch_append("Scratch", "world").unwrap();
+        assert_eq!(a.scratch_text("Scratch").unwrap(), "hello world");
+        assert_eq!(a.export_scratch().unwrap().len(), 2);
+
+        let env2 = a.scratch_envelope("Scratch").unwrap().unwrap();
+        let opened = a.open_envelope(&env2).unwrap();
+        let (_, update) = decode_scratch_body(&opened.plaintext).unwrap();
+        let full = a.load_scratch("Scratch").unwrap().encode_update();
+        assert_ne!(
+            update, full,
+            "second sealed body must not be a full empty-SV encode"
+        );
+        assert!(
+            update.len() < full.len(),
+            "diff {} bytes should be smaller than full {} bytes",
+            update.len(),
+            full.len()
+        );
+
+        let (_dir, mut b) = open_peer_store(&a);
+        b.ingest_scratch_envelope(env1).unwrap();
+        b.ingest_scratch_envelope(env2).unwrap();
+        assert_eq!(b.scratch_text("Scratch").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn ingest_then_local_append_encodes_diff() {
+        let mut a = SqliteStore::memory();
+        a.scratch_append("Scratch", "hello ").unwrap();
+        let env = a.scratch_envelope("Scratch").unwrap().unwrap();
+
+        let (_dir, mut b) = open_peer_store(&a);
+        b.ingest_scratch_envelope(env).unwrap();
+        b.scratch_append("Scratch", "world").unwrap();
+        assert_eq!(b.scratch_text("Scratch").unwrap(), "hello world");
+
+        let env2 = b.scratch_envelope("Scratch").unwrap().unwrap();
+        let opened = b.open_envelope(&env2).unwrap();
+        let (_, update) = decode_scratch_body(&opened.plaintext).unwrap();
+        let full = b.load_scratch("Scratch").unwrap().encode_update();
+        assert!(
+            update.len() < full.len(),
+            "post-ingest local edit should seal a diff ({} vs full {})",
+            update.len(),
+            full.len()
+        );
     }
 
     #[test]

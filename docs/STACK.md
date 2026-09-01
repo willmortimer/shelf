@@ -66,7 +66,7 @@ Invariant: `shelf-core` must not depend on `shelf-mailbox`.
 
 Listed for later implementation; not added to manifests in the bootstrap pass.
 
-- CRDT text: Yrs (`yrs`) for scratchpads (design pack suggested Automerge; implementation uses Yrs)
+- CRDT text: Yrs (`yrs`) for scratchpads (design pack suggested Automerge; implementation uses Yrs). After the first write, persist seals a Yrs update encoded from the last-applied state vector rather than a full empty-SV document.
 - Local store: SQLite via `rusqlite` (bundled)
 - Crypto providers: X25519, ML-KEM-768, XChaCha20-Poly1305, Argon2id, keyed BLAKE3
 - Desktop: Slint

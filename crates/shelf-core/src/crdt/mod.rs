@@ -6,6 +6,7 @@
 use crate::hexutil::define_id32;
 use thiserror::Error;
 use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
 
 define_id32! {
@@ -78,6 +79,26 @@ impl ScratchPad {
         txn.encode_state_as_update_v1(&StateVector::default())
     }
 
+    /// Encode this replica's Yrs v1 state vector.
+    #[must_use]
+    pub fn state_vector(&self) -> Vec<u8> {
+        let txn = self.doc.transact();
+        txn.state_vector().encode_v1()
+    }
+
+    /// Encode a Yrs v1 update containing only changes after `sv`.
+    ///
+    /// If `sv` is not a valid state vector, returns a full [`Self::encode_update`] so
+    /// callers never persist an empty or truncated body.
+    #[must_use]
+    pub fn encode_diff_from(&self, sv: &[u8]) -> Vec<u8> {
+        let Ok(decoded) = StateVector::decode_v1(sv) else {
+            return self.encode_update();
+        };
+        let txn = self.doc.transact();
+        txn.encode_state_as_update_v1(&decoded)
+    }
+
     /// Merge a Yrs v1 update into this replica.
     pub fn apply_update(&mut self, update: &[u8]) -> Result<(), CrdtError> {
         let decoded = Update::decode_v1(update).map_err(|_| CrdtError::InvalidUpdate)?;
@@ -131,5 +152,30 @@ mod tests {
         let mut pad = ScratchPad::new("Current");
         let err = pad.apply_update(b"not-a-yrs-update").unwrap_err();
         assert_eq!(err, CrdtError::InvalidUpdate);
+    }
+
+    #[test]
+    fn second_edit_diff_is_smaller_and_merges() {
+        let mut a = ScratchPad::new("Scratch");
+        a.insert_text("hello from A");
+        let first = a.encode_update();
+        let sv = a.state_vector();
+
+        a.insert_text(" and a second insert that should not rewrite the whole doc");
+        let full = a.encode_update();
+        let diff = a.encode_diff_from(&sv);
+        assert!(
+            diff.len() < full.len(),
+            "diff {} bytes should be smaller than full {} bytes",
+            diff.len(),
+            full.len()
+        );
+
+        let mut b = ScratchPad::new("Scratch");
+        b.apply_update(&first).unwrap();
+        b.apply_update(&diff).unwrap();
+        assert_eq!(a.text(), b.text());
+        assert!(a.text().contains("hello from A"));
+        assert!(a.text().contains("second insert"));
     }
 }
