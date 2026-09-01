@@ -18,7 +18,14 @@ jobs:
       - name: Install Linux GUI libs (Slint)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          sudo apt-get install -y \
+            pkg-config \
+            libfontconfig1-dev \
+            libxcb1-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
