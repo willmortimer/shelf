@@ -224,8 +224,10 @@ async fn rpc(path: &Path, req: &IpcRequest) -> Result<IpcResponse, ClientError> 
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(ClientError::Protocol("empty response from daemon".into()));
+        if n == 0 || line.len() > shelf_core::MAX_FRAME_BYTES {
+            return Err(ClientError::Protocol(
+                "empty or oversized response from daemon".into(),
+            ));
         }
         serde_json::from_str(line.trim_end()).map_err(|e| ClientError::Decode(e.to_string()))
     }
@@ -240,8 +242,10 @@ async fn rpc(path: &Path, req: &IpcRequest) -> Result<IpcResponse, ClientError> 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(ClientError::Protocol("empty response from daemon".into()));
+        if n == 0 || line.len() > shelf_core::MAX_FRAME_BYTES {
+            return Err(ClientError::Protocol(
+                "empty or oversized response from daemon".into(),
+            ));
         }
         serde_json::from_str(line.trim_end()).map_err(|e| ClientError::Decode(e.to_string()))
     }

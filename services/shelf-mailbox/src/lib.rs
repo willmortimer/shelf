@@ -6,6 +6,8 @@
 #![deny(missing_docs)]
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +25,9 @@ pub enum MailboxError {
     /// JSON framing.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// Mailbox is over quota.
+    #[error("mailbox over quota")]
+    Quota,
 }
 
 /// One ciphertext item. The mailbox never inspects the payload.
@@ -105,17 +110,96 @@ struct Stored {
     expires_unix: u64,
 }
 
-/// In-memory ciphertext queue.
-#[derive(Default)]
+#[derive(Serialize, Deserialize)]
+struct DiskMailbox {
+    v: u16,
+    slots: HashMap<String, HashMap<String, DiskItem>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiskItem {
+    #[serde(with = "b64")]
+    ciphertext: Vec<u8>,
+    expires_unix: u64,
+}
+
+/// Maximum ciphertext bytes per item.
+pub const MAX_ITEM_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum items per mailbox id.
+pub const MAX_ITEMS: usize = 4096;
+/// Maximum total bytes per mailbox id.
+pub const MAX_MAILBOX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Ciphertext queue with caps and optional disk persist.
 pub struct Mailbox {
+    path: Option<PathBuf>,
     inner: Mutex<HashMap<String, HashMap<String, Stored>>>,
 }
 
+impl Default for Mailbox {
+    fn default() -> Self {
+        Self {
+            path: None,
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 impl Mailbox {
-    /// Empty mailbox.
+    /// Empty in-memory mailbox.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open or create a persisted mailbox at `path`.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MailboxError> {
+        let path = path.as_ref().to_path_buf();
+        let inner = if path.exists() {
+            load_disk(&path)?
+        } else {
+            HashMap::new()
+        };
+        Ok(Self {
+            path: Some(path),
+            inner: Mutex::new(inner),
+        })
+    }
+
+    fn persist(path: Option<&Path>, map: &HashMap<String, HashMap<String, Stored>>) {
+        let Some(path) = path else {
+            return;
+        };
+        let disk = DiskMailbox {
+            v: 1,
+            slots: map
+                .iter()
+                .map(|(mid, slot)| {
+                    (
+                        mid.clone(),
+                        slot.iter()
+                            .map(|(oid, stored)| {
+                                (
+                                    oid.clone(),
+                                    DiskItem {
+                                        ciphertext: stored.ciphertext.clone(),
+                                        expires_unix: stored.expires_unix,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        };
+        let Ok(bytes) = serde_json::to_vec(&disk) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, bytes).is_ok() {
+            let _ = fs::remove_file(path);
+            let _ = fs::rename(&tmp, path);
+        }
     }
 
     fn now() -> u64 {
@@ -130,7 +214,16 @@ impl Mailbox {
     }
 
     /// PUT.
-    pub fn put(&self, mailbox_id: &str, object_id: String, ciphertext: Vec<u8>, ttl_secs: u64) {
+    pub fn put(
+        &self,
+        mailbox_id: &str,
+        object_id: String,
+        ciphertext: Vec<u8>,
+        ttl_secs: u64,
+    ) -> Result<(), MailboxError> {
+        if ciphertext.len() > MAX_ITEM_BYTES {
+            return Err(MailboxError::Quota);
+        }
         let mut inner = self
             .inner
             .lock()
@@ -138,6 +231,10 @@ impl Mailbox {
         let now = Self::now();
         let slot = inner.entry(mailbox_id.to_owned()).or_default();
         Self::gc(slot, now);
+        let used: usize = slot.values().map(|s| s.ciphertext.len()).sum();
+        if slot.len() >= MAX_ITEMS || used.saturating_add(ciphertext.len()) > MAX_MAILBOX_BYTES {
+            return Err(MailboxError::Quota);
+        }
         slot.insert(
             object_id,
             Stored {
@@ -145,6 +242,8 @@ impl Mailbox {
                 expires_unix: now.saturating_add(ttl_secs),
             },
         );
+        Self::persist(self.path.as_deref(), &inner);
+        Ok(())
     }
 
     /// GET (does not remove).
@@ -175,7 +274,36 @@ impl Mailbox {
         if let Some(slot) = inner.get_mut(mailbox_id) {
             slot.remove(object_id);
         }
+        Self::persist(self.path.as_deref(), &inner);
     }
+}
+
+fn load_disk(path: &Path) -> Result<HashMap<String, HashMap<String, Stored>>, MailboxError> {
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let disk: DiskMailbox = serde_json::from_slice(&bytes)?;
+    Ok(disk
+        .slots
+        .into_iter()
+        .map(|(mid, slot)| {
+            (
+                mid,
+                slot.into_iter()
+                    .map(|(oid, item)| {
+                        (
+                            oid,
+                            Stored {
+                                ciphertext: item.ciphertext,
+                                expires_unix: item.expires_unix,
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect())
 }
 
 /// Serve newline-delimited JSON on `addr`.
@@ -206,7 +334,7 @@ async fn handle(stream: TcpStream, mailbox: Arc<Mailbox>) -> Result<(), MailboxE
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
-    if n == 0 || line.trim().is_empty() {
+    if n == 0 || line.len() > MAX_ITEM_BYTES {
         return Ok(());
     }
     let response = match serde_json::from_str::<MailboxRequest>(line.trim_end()) {
@@ -215,10 +343,14 @@ async fn handle(stream: TcpStream, mailbox: Arc<Mailbox>) -> Result<(), MailboxE
             object_id,
             ciphertext,
             ttl_secs,
-        }) => {
-            mailbox.put(&mailbox_id, object_id, ciphertext, ttl_secs);
-            MailboxResponse::Ok
-        }
+        }) => mailbox
+            .put(&mailbox_id, object_id, ciphertext, ttl_secs)
+            .map_or_else(
+                |e| MailboxResponse::Error {
+                    message: e.to_string(),
+                },
+                |()| MailboxResponse::Ok,
+            ),
         Ok(MailboxRequest::Get { mailbox_id }) => MailboxResponse::Items {
             items: mailbox.get(&mailbox_id),
         },
@@ -357,5 +489,32 @@ mod tests {
         assert!(!String::from_utf8_lossy(&serde_json::to_vec(&items[0]).unwrap()).is_empty());
         client.ack("mid", "obj1").await.unwrap();
         assert!(client.get("mid").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn put_rejects_oversize_item() {
+        let mailbox = Mailbox::new();
+        let big = vec![1u8; MAX_ITEM_BYTES + 1];
+        assert!(matches!(
+            mailbox.put("mid", "x".into(), big, 60),
+            Err(MailboxError::Quota)
+        ));
+    }
+
+    #[test]
+    fn persist_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("shelf-mb-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("mailbox.json");
+        let mailbox = Mailbox::open(&path).unwrap();
+        mailbox
+            .put("mid", "obj1".into(), b"ciphertext-only".to_vec(), 60)
+            .unwrap();
+        drop(mailbox);
+        let reopened = Mailbox::open(&path).unwrap();
+        let items = reopened.get("mid");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].ciphertext, b"ciphertext-only");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
