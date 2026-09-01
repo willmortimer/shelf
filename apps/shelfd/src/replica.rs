@@ -8,15 +8,15 @@ use std::time::Duration;
 use crate::store::MemoryStore;
 #[cfg(test)]
 use shelf_core::VaultId;
-use shelf_core::{DeviceId, ObjectId, SigningPublicKey, Timestamp};
+use shelf_core::{DeviceId, ObjectId, SigningPublicKey, Timestamp, TransportHint};
 use shelf_keystore::{DeviceSigner, verify_signature};
 use shelf_protocol::EncryptedObject;
 use shelf_store::SqliteStore;
 use shelf_transport::{
     LanTransport, MailboxClient, OpBody, OriginCursor, PeerMessage, ReplicaFrame, SessionHello,
-    SignedOperation, accept_tls, connect_tls, hello_transcript, new_op_id, parse_home_config,
-    parse_sig_hex, read_bounded_line, sig_hex, tailscale_status, tls_exporter_client,
-    tls_exporter_server, write_bounded_line,
+    SignedOperation, accept_tls, connect_tls, dial_addrs, hello_transcript, new_op_id,
+    parse_home_config, parse_sig_hex, read_bounded_line, sig_hex, tailscale_status,
+    tls_exporter_client, tls_exporter_server, write_bounded_line,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -299,7 +299,7 @@ async fn push_now(
     lan: Option<&LanTransport>,
     peer_port: u16,
 ) -> Result<(), std::io::Error> {
-    let (need_frames, our_cursors, bindings) = {
+    let (need_frames, our_cursors, bindings, member_hints) = {
         let store = store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -336,7 +336,8 @@ async fn push_now(
             .flatten()
             .map(|s| s.mailbox_bindings)
             .unwrap_or_default();
-        (need_frames, our_cursors, bindings)
+        let member_hints = validated_member_hints(&store);
+        (need_frames, our_cursors, bindings, member_hints)
     };
 
     if let Some(lan) = lan {
@@ -393,7 +394,7 @@ async fn push_now(
         }
     }
 
-    let addrs = tailscale_peer_addrs(peer_port);
+    let addrs = tailscale_peer_addrs(&member_hints, peer_port);
     for addr in addrs {
         let _ = send_session_batch(addr, signer, store, &our_cursors, &need_frames).await;
     }
@@ -583,19 +584,34 @@ async fn send_session_batch(
     Ok(())
 }
 
-fn tailscale_peer_addrs(peer_port: u16) -> Vec<SocketAddr> {
+fn validated_member_hints(store: &SqliteStore) -> Vec<TransportHint> {
+    let Ok(members) = store.validated_members() else {
+        return Vec::new();
+    };
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let local = store.device_id();
+    let ids: std::collections::BTreeSet<_> = members
+        .into_iter()
+        .map(|c| c.device_id)
+        .filter(|id| *id != local)
+        .collect();
+    let Ok(Some(snap)) = store.membership_snapshot() else {
+        return Vec::new();
+    };
+    snap.routing_hints
+        .into_iter()
+        .filter(|b| ids.contains(&b.device_id))
+        .flat_map(|b| b.hints)
+        .collect()
+}
+
+fn tailscale_peer_addrs(member_hints: &[TransportHint], peer_port: u16) -> Vec<SocketAddr> {
     let Ok(status) = tailscale_status() else {
         return Vec::new();
     };
-    let mut addrs = Vec::new();
-    for peer in status.peers.into_iter().filter(|p| p.online) {
-        for ip in peer.ips {
-            if let Ok(addr) = format!("{ip}:{peer_port}").parse() {
-                addrs.push(addr);
-            }
-        }
-    }
-    addrs
+    dial_addrs(&status, member_hints, peer_port)
 }
 
 fn sign_frame(frame: &mut ReplicaFrame, signer: &DeviceSigner) {
@@ -855,6 +871,24 @@ mod tests {
             request_hash: [0; 32],
             issuer_signature: shelf_core::SignatureBytes::from_bytes([0; 64]),
         }
+    }
+
+    #[test]
+    fn validated_member_hints_empty_without_signed_snapshot() {
+        use shelf_protocol::EpochKey;
+        let dir = tempfile::tempdir().unwrap();
+        let ka = DeviceKeystore::open_or_init(dir.path(), Some("a"), None, true).unwrap();
+        let sa = ka.device_signer();
+        let store = SqliteStore::open(
+            &dir.path().join("state.db"),
+            EpochKey::from_bytes(*EpochKey::new().as_bytes()),
+            sa.device_id(),
+            EpochId::new(1),
+            VaultId::new(),
+            &[0xEE; 32],
+        )
+        .unwrap();
+        assert!(validated_member_hints(&store).is_empty());
     }
 
     #[test]

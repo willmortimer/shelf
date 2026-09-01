@@ -107,6 +107,10 @@ pub fn parse_home_config(path: &Path) -> HomeConfig {
 pub struct TailscaleStatus {
     /// Whether this node believes it is online.
     pub self_online: bool,
+    /// This node's Tailscale IPs (not membership).
+    pub self_ips: Vec<String>,
+    /// This node's MagicDNS name, if any.
+    pub self_dns_name: String,
     /// Discovered tailnet peers (connectivity, not membership).
     pub peers: Vec<TailscalePeer>,
 }
@@ -141,13 +145,29 @@ pub fn tailscale_status() -> Result<TailscaleStatus, TransportError> {
     parse_tailscale_json(&output.stdout)
 }
 
-fn parse_tailscale_json(bytes: &[u8]) -> Result<TailscaleStatus, TransportError> {
+/// Parse `tailscale status --json` bytes.
+pub fn parse_tailscale_json(bytes: &[u8]) -> Result<TailscaleStatus, TransportError> {
     let v: serde_json::Value = serde_json::from_slice(bytes)?;
-    let self_online = v
-        .get("Self")
+    let self_node = v.get("Self");
+    let self_online = self_node
         .and_then(|s| s.get("Online"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let self_dns_name = self_node
+        .and_then(|s| s.get("DNSName"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_owned();
+    let self_ips = self_node
+        .and_then(|s| s.get("TailscaleIPs"))
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut peers = Vec::new();
     if let Some(map) = v.get("Peer").and_then(serde_json::Value::as_object) {
         for (key, peer) in map {
@@ -184,7 +204,89 @@ fn parse_tailscale_json(bytes: &[u8]) -> Result<TailscaleStatus, TransportError>
             });
         }
     }
-    Ok(TailscaleStatus { self_online, peers })
+    Ok(TailscaleStatus {
+        self_online,
+        self_ips,
+        self_dns_name,
+        peers,
+    })
+}
+
+/// Dial set: online Tailscale IPs that appear in a validated member hint.
+///
+/// Empty `member_hints` yields no addresses (do not spray the tailnet).
+/// LAN and rendezvous hints are ignored here; mailbox/LAN fan-out is separate.
+#[must_use]
+pub fn dial_addrs(
+    status: &TailscaleStatus,
+    member_hints: &[shelf_core::TransportHint],
+    peer_port: u16,
+) -> Vec<SocketAddr> {
+    if member_hints.is_empty() {
+        return Vec::new();
+    }
+    let hint_hosts: Vec<String> = member_hints
+        .iter()
+        .filter_map(|h| match h {
+            shelf_core::TransportHint::Tailscale { address } => Some(hint_host(address).to_owned()),
+            shelf_core::TransportHint::Lan { .. }
+            | shelf_core::TransportHint::RendezvousToken { .. } => None,
+        })
+        .collect();
+    if hint_hosts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ips = std::collections::BTreeSet::new();
+    for peer in status.peers.iter().filter(|p| p.online) {
+        let dns_hinted = hint_hosts.iter().any(|h| dns_eq(h, &peer.dns_name));
+        for ip in &peer.ips {
+            let Some(canon) = canonical_ip(ip) else {
+                continue;
+            };
+            let ip_hinted = hint_hosts
+                .iter()
+                .any(|h| canonical_ip(h).as_ref() == Some(&canon));
+            if ip_hinted || dns_hinted {
+                ips.insert(canon);
+            }
+        }
+    }
+    ips.into_iter()
+        .filter_map(|ip| parse_socket_addr(&ip, peer_port))
+        .collect()
+}
+
+fn hint_host(address: &str) -> &str {
+    if let Some(rest) = address.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &rest[..end];
+    }
+    if let Some((host, port)) = address.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return host;
+    }
+    address
+}
+
+fn dns_eq(a: &str, b: &str) -> bool {
+    a.trim_end_matches('.')
+        .eq_ignore_ascii_case(b.trim_end_matches('.'))
+}
+
+fn canonical_ip(s: &str) -> Option<String> {
+    s.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string())
+}
+
+fn parse_socket_addr(ip: &str, port: u16) -> Option<SocketAddr> {
+    if let Ok(addr) = format!("{ip}:{port}").parse() {
+        return Some(addr);
+    }
+    format!("[{ip}]:{port}").parse().ok()
 }
 
 fn peer_id_from_key(key: &[u8]) -> PeerId {
@@ -347,6 +449,72 @@ mod tests {
         assert_eq!(status.peers[0].dns_name, "laptop.tailnet.ts.net");
         assert!(!status.peers[0].relayed);
         assert_eq!(status.peers[0].ips, vec!["100.64.0.1"]);
+    }
+
+    fn two_peer_status_json() -> &'static [u8] {
+        br#"{
+            "Self": {"Online": true, "DNSName": "me.tailnet.ts.net.", "TailscaleIPs": ["100.64.0.9"]},
+            "Peer": {
+                "nodekey:member": {
+                    "DNSName": "laptop.tailnet.ts.net.",
+                    "Online": true,
+                    "CurAddr": "1.2.3.4:123",
+                    "TailscaleIPs": ["100.64.0.1"]
+                },
+                "nodekey:stranger": {
+                    "DNSName": "stranger.tailnet.ts.net.",
+                    "Online": true,
+                    "CurAddr": "",
+                    "TailscaleIPs": ["100.64.0.2"]
+                },
+                "nodekey:offline-member": {
+                    "DNSName": "phone.tailnet.ts.net.",
+                    "Online": false,
+                    "CurAddr": "",
+                    "TailscaleIPs": ["100.64.0.3"]
+                }
+            }
+        }"#
+    }
+
+    #[test]
+    fn dial_addrs_intersects_online_member_hints_only() {
+        use shelf_core::TransportHint;
+        let status = parse_tailscale_json(two_peer_status_json()).unwrap();
+        let member_hints = vec![
+            TransportHint::Tailscale {
+                address: "100.64.0.1".into(),
+            },
+            TransportHint::Tailscale {
+                address: "100.64.0.3".into(),
+            },
+        ];
+        let addrs = dial_addrs(&status, &member_hints, 18733);
+        assert_eq!(
+            addrs,
+            vec!["100.64.0.1:18733".parse::<SocketAddr>().unwrap()]
+        );
+        assert!(!addrs.iter().any(|a| a.ip().to_string() == "100.64.0.2"));
+    }
+
+    #[test]
+    fn dial_addrs_empty_hints_does_not_spray_tailnet() {
+        let status = parse_tailscale_json(two_peer_status_json()).unwrap();
+        assert!(dial_addrs(&status, &[], 18733).is_empty());
+    }
+
+    #[test]
+    fn dial_addrs_matches_magicdns_hint() {
+        use shelf_core::TransportHint;
+        let status = parse_tailscale_json(two_peer_status_json()).unwrap();
+        let hints = vec![TransportHint::Tailscale {
+            address: "laptop.tailnet.ts.net".into(),
+        }];
+        let addrs = dial_addrs(&status, &hints, 18733);
+        assert_eq!(
+            addrs,
+            vec!["100.64.0.1:18733".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     #[tokio::test]

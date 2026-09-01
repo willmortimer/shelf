@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use shelf_core::enrollment::{
     DeviceCapabilities, ENROLLMENT_PROTOCOL_VERSION, EncryptedVaultKeyEnvelope, EnrollmentRequest,
     MailboxBinding, MemberRole, MembershipCertificate, MembershipGrant, MembershipSnapshot,
-    SignatureBytes, TransportHint, VaultRoot,
+    RoutingBinding, SignatureBytes, TransportHint, VaultRoot,
 };
 use shelf_core::{
     DOMAIN_ENROLL_GENESIS, DOMAIN_ENROLL_SAS, DOMAIN_ENROLL_WRAP, HybridKemPublicKey, Timestamp,
@@ -91,10 +91,16 @@ pub fn ensure_local_root(vault: &mut Vault) -> Result<VaultRoot, KeystoreError> 
 }
 
 /// Export a `.shelfjoin` from a joining vault.
+///
+/// Empty `hints` are filled from local Tailscale self-IPs / MagicDNS and an
+/// optional `lan_address` in the vault home `config.toml`.
 pub fn export_join(
     vault: &Vault,
-    hints: Vec<TransportHint>,
+    mut hints: Vec<TransportHint>,
 ) -> Result<(ShelfJoin, String), KeystoreError> {
+    if hints.is_empty() {
+        hints = collect_local_transport_hints(vault);
+    }
     let id = vault.keys.public_identity();
     let nonce: [u8; 32] = rand::random();
     let expires_at =
@@ -353,17 +359,126 @@ pub(crate) fn sign_snapshot(
     if let Some(id) = exclude {
         mailbox_bindings.retain(|b| b.device_id != id);
     }
+    let mut routing_hints = vault
+        .store
+        .membership_snapshot()
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?
+        .map(|s| s.routing_hints)
+        .unwrap_or_default();
+    routing_hints.extend(routing_hints_local(vault));
+    if let Some(join) = join
+        && !join.request.transport_hints.is_empty()
+    {
+        routing_hints.push(RoutingBinding {
+            device_id: join.request.device_id,
+            hints: join.request.transport_hints.clone(),
+        });
+    }
+    routing_hints.sort_by(|a, b| a.device_id.as_bytes().cmp(b.device_id.as_bytes()));
+    routing_hints.dedup_by(|a, b| a.device_id == b.device_id);
+    if let Some(id) = exclude {
+        routing_hints.retain(|b| b.device_id != id);
+    }
     let mut snapshot = MembershipSnapshot {
         vault_root: root.clone(),
         generation,
         epoch: vault.store.epoch(),
         certificates,
         mailbox_bindings,
+        routing_hints,
         snapshot_signature: SignatureBytes::from_bytes([0; 64]),
     };
     let body = snapshot.transcript();
     snapshot.snapshot_signature = SignatureBytes::from_bytes(vault.keys.sign(body.as_bytes()));
     Ok(snapshot)
+}
+
+fn routing_hints_local(vault: &Vault) -> Vec<RoutingBinding> {
+    let hints = collect_local_transport_hints(vault);
+    if hints.is_empty() {
+        return Vec::new();
+    }
+    vec![RoutingBinding {
+        device_id: vault.keys.public_identity().device_id,
+        hints,
+    }]
+}
+
+fn collect_local_transport_hints(vault: &Vault) -> Vec<TransportHint> {
+    let mut hints = tailscale_self_hints();
+    if let Some(lan) = lan_hint_from_home(vault.keys.home()) {
+        hints.push(lan);
+    }
+    hints
+}
+
+/// Best-effort: host `tailscale status --json` Self IPs and MagicDNS.
+fn tailscale_self_hints() -> Vec<TransportHint> {
+    let output = std::process::Command::new("tailscale")
+        .arg("status")
+        .arg("--json")
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    tailscale_self_hints_from_json(&output.stdout)
+}
+
+fn tailscale_self_hints_from_json(bytes: &[u8]) -> Vec<TransportHint> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(self_node) = v.get("Self") else {
+        return Vec::new();
+    };
+    let mut hints = Vec::new();
+    if let Some(dns) = self_node.get("DNSName").and_then(serde_json::Value::as_str) {
+        let dns = dns.trim_end_matches('.');
+        if !dns.is_empty() {
+            hints.push(TransportHint::Tailscale {
+                address: dns.to_owned(),
+            });
+        }
+    }
+    if let Some(ips) = self_node
+        .get("TailscaleIPs")
+        .and_then(serde_json::Value::as_array)
+    {
+        for ip in ips.iter().filter_map(serde_json::Value::as_str) {
+            if !ip.is_empty() {
+                hints.push(TransportHint::Tailscale {
+                    address: ip.to_owned(),
+                });
+            }
+        }
+    }
+    hints
+}
+
+fn lan_hint_from_home(home: &std::path::Path) -> Option<TransportHint> {
+    let text = std::fs::read_to_string(home.join("config.toml")).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "lan_address" {
+            continue;
+        }
+        let val = v.trim().trim_matches('"');
+        if !val.is_empty() {
+            return Some(TransportHint::Lan {
+                address: val.to_owned(),
+            });
+        }
+    }
+    None
 }
 
 fn mailbox_bindings_local(vault: &Vault) -> Result<Vec<MailboxBinding>, KeystoreError> {
@@ -499,4 +614,81 @@ fn sas_eq(expected: &str, actual: &str) -> bool {
     let a = norm(expected);
     let b = norm(actual);
     a == b && a.split_whitespace().count() == 6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::open_or_create_vault;
+
+    #[test]
+    fn tailscale_self_json_becomes_hints() {
+        let json = br#"{
+            "Self": {
+                "Online": true,
+                "DNSName": "phone.tailnet.ts.net.",
+                "TailscaleIPs": ["100.64.0.9", "fd7a:115c:a1e0::9"]
+            },
+            "Peer": {}
+        }"#;
+        let hints = tailscale_self_hints_from_json(json);
+        assert!(hints.contains(&TransportHint::Tailscale {
+            address: "phone.tailnet.ts.net".into(),
+        }));
+        assert!(hints.contains(&TransportHint::Tailscale {
+            address: "100.64.0.9".into(),
+        }));
+        assert!(hints.contains(&TransportHint::Tailscale {
+            address: "fd7a:115c:a1e0::9".into(),
+        }));
+    }
+
+    #[test]
+    fn lan_address_from_config_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "lan_address = \"192.0.2.10:18732\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lan_hint_from_home(dir.path()),
+            Some(TransportHint::Lan {
+                address: "192.0.2.10:18732".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn snapshot_copies_join_hints_and_verify() {
+        let member_dir = tempfile::tempdir().unwrap();
+        let join_dir = tempfile::tempdir().unwrap();
+        let member = open_or_create_vault(member_dir.path(), Some("mac"), None, true).unwrap();
+        let mut joiner = open_or_create_vault(join_dir.path(), Some("linux"), None, true).unwrap();
+        let hints = vec![TransportHint::Tailscale {
+            address: "100.64.1.10".into(),
+        }];
+        let (join, _) = export_join(&joiner, hints.clone()).unwrap();
+        assert_eq!(join.request.transport_hints, hints);
+        let (grant, sas) = approve_join(&member, &join).unwrap();
+        let snap = &grant.grant.snapshot;
+        let root = &grant.grant.vault_root;
+        assert!(snap.verify(root));
+        assert!(
+            snap.routing_hints
+                .iter()
+                .any(|b| { b.device_id == join.request.device_id && b.hints == hints }),
+            "join transport hints must land on the snapshot"
+        );
+        let json = serde_json::to_vec(snap).unwrap();
+        let back: MembershipSnapshot = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, *snap);
+        assert!(back.verify(root));
+        let mut tampered = snap.clone();
+        tampered.routing_hints.clear();
+        assert!(!tampered.verify(root));
+        import_grant(&mut joiner, &grant, &sas).unwrap();
+        let stored = joiner.store.membership_snapshot().unwrap().unwrap();
+        assert!(stored.verify(&grant.grant.vault_root));
+    }
 }

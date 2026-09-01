@@ -10,8 +10,8 @@ use std::io;
 use shelf_core::{
     AeadAlgorithm, ChunkId, ContentKind, DeviceCapabilities, DeviceId, EpochId, HybridKemPublicKey,
     MAX_FRAME_BYTES, MailboxBinding, MemberRole, MembershipCertificate, MembershipSnapshot,
-    MlKem768PublicKey, ObjectId, SignatureBytes, SigningPublicKey, Timestamp, VaultId, VaultRoot,
-    X25519PublicKey,
+    MlKem768PublicKey, ObjectId, RoutingBinding, SignatureBytes, SigningPublicKey, Timestamp,
+    TransportHint, VaultId, VaultRoot, X25519PublicKey,
 };
 use shelf_protocol::{DeviceEpochWrap, EncryptedObject, Hash, HybridEpochWrap, KeyEnvelope};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -411,6 +411,10 @@ fn encode_snapshot(w: &mut W, snap: &MembershipSnapshot) -> io::Result<()> {
     for b in &snap.mailbox_bindings {
         encode_mailbox_binding(w, b)?;
     }
+    w.u32(u32_len(snap.routing_hints.len())?);
+    for b in &snap.routing_hints {
+        encode_routing_binding(w, b)?;
+    }
     w.fixed(snap.snapshot_signature.as_bytes());
     Ok(())
 }
@@ -429,12 +433,18 @@ fn decode_snapshot(r: &mut R<'_>) -> io::Result<MembershipSnapshot> {
     for _ in 0..n_binds {
         mailbox_bindings.push(decode_mailbox_binding(r)?);
     }
+    let n_routes = r.u32()? as usize;
+    let mut routing_hints = Vec::with_capacity(n_routes);
+    for _ in 0..n_routes {
+        routing_hints.push(decode_routing_binding(r)?);
+    }
     Ok(MembershipSnapshot {
         vault_root,
         generation,
         epoch,
         certificates,
         mailbox_bindings,
+        routing_hints,
         snapshot_signature: SignatureBytes::from_bytes(r.fixed64()?),
     })
 }
@@ -558,6 +568,55 @@ fn decode_mailbox_binding(r: &mut R<'_>) -> io::Result<MailboxBinding> {
         mailbox_id: r.str16()?,
         write_cap: r.str16()?,
     })
+}
+
+fn encode_routing_binding(w: &mut W, b: &RoutingBinding) -> io::Result<()> {
+    w.fixed(b.device_id.as_bytes());
+    w.u32(u32_len(b.hints.len())?);
+    for hint in &b.hints {
+        encode_transport_hint(w, hint)?;
+    }
+    Ok(())
+}
+
+fn decode_routing_binding(r: &mut R<'_>) -> io::Result<RoutingBinding> {
+    let device_id = DeviceId::from_bytes(r.fixed32()?);
+    let n = r.u32()? as usize;
+    let mut hints = Vec::with_capacity(n);
+    for _ in 0..n {
+        hints.push(decode_transport_hint(r)?);
+    }
+    Ok(RoutingBinding { device_id, hints })
+}
+
+fn encode_transport_hint(w: &mut W, hint: &TransportHint) -> io::Result<()> {
+    match hint {
+        TransportHint::Lan { address } => {
+            w.u8(1);
+            w.str16(address)
+        }
+        TransportHint::Tailscale { address } => {
+            w.u8(2);
+            w.str16(address)
+        }
+        TransportHint::RendezvousToken { token } => {
+            w.u8(3);
+            w.str16(token)
+        }
+    }
+}
+
+fn decode_transport_hint(r: &mut R<'_>) -> io::Result<TransportHint> {
+    match r.u8()? {
+        1 => Ok(TransportHint::Lan {
+            address: r.str16()?,
+        }),
+        2 => Ok(TransportHint::Tailscale {
+            address: r.str16()?,
+        }),
+        3 => Ok(TransportHint::RendezvousToken { token: r.str16()? }),
+        _ => Err(invalid("unknown transport hint")),
+    }
 }
 
 fn encode_device_wrap(w: &mut W, env: &DeviceEpochWrap) -> io::Result<()> {
