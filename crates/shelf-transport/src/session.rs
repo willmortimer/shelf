@@ -15,8 +15,13 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
+/// ALPN for newline-JSON peer sessions (legacy until replica switches).
+pub const PEER_ALPN_V1: &[u8] = b"shelf/1";
+/// ALPN for length-prefixed binary peer sessions ([`crate::read_peer_frame`]).
+pub const PEER_ALPN_V2: &[u8] = b"shelf/2";
+
 /// First application record after TLS: membership binding.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionHello {
     /// Vault the speaker belongs to.
     pub vault_id: VaultId,
@@ -144,24 +149,32 @@ impl ServerCertVerifier for AcceptAnyServer {
 
 /// TLS server config: self-signed, no WebPKI client check (membership is out of band).
 pub fn server_config() -> Result<Arc<ServerConfig>, io::Error> {
+    server_config_alpn(PEER_ALPN_V1)
+}
+
+fn server_config_alpn(alpn: &[u8]) -> Result<Arc<ServerConfig>, io::Error> {
     install_provider();
     let (certs, key) = self_signed()?;
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key.into())
         .map_err(io::Error::other)?;
-    cfg.alpn_protocols = vec![b"shelf/1".to_vec()];
+    cfg.alpn_protocols = vec![alpn.to_vec()];
     Ok(Arc::new(cfg))
 }
 
 /// TLS client config: encrypts the session; membership is verified after hello.
 pub fn client_config() -> Result<Arc<ClientConfig>, io::Error> {
+    client_config_alpn(PEER_ALPN_V1)
+}
+
+fn client_config_alpn(alpn: &[u8]) -> Result<Arc<ClientConfig>, io::Error> {
     install_provider();
     let mut cfg = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServer))
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"shelf/1".to_vec()];
+    cfg.alpn_protocols = vec![alpn.to_vec()];
     Ok(Arc::new(cfg))
 }
 
@@ -171,11 +184,43 @@ pub async fn accept_tls(stream: TcpStream) -> Result<ServerTlsStream<TcpStream>,
     acceptor.accept(stream).await.map_err(io::Error::other)
 }
 
+/// Accept a TLS session negotiating ALPN [`PEER_ALPN_V2`].
+pub async fn accept_tls_v2(stream: TcpStream) -> Result<ServerTlsStream<TcpStream>, io::Error> {
+    accept_tls_alpn(stream, PEER_ALPN_V2).await
+}
+
+async fn accept_tls_alpn(
+    stream: TcpStream,
+    alpn: &[u8],
+) -> Result<ServerTlsStream<TcpStream>, io::Error> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config_alpn(alpn)?);
+    acceptor.accept(stream).await.map_err(io::Error::other)
+}
+
 /// Connect TLS to `stream`. Server name is unused (custom verifier).
 pub async fn connect_tls(
     stream: TcpStream,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, io::Error> {
     let connector = TlsConnector::from(client_config()?);
+    let name = ServerName::try_from("shelf-peer").map_err(io::Error::other)?;
+    connector
+        .connect(name, stream)
+        .await
+        .map_err(io::Error::other)
+}
+
+/// Connect TLS negotiating ALPN [`PEER_ALPN_V2`].
+pub async fn connect_tls_v2(
+    stream: TcpStream,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, io::Error> {
+    connect_tls_alpn(stream, PEER_ALPN_V2).await
+}
+
+async fn connect_tls_alpn(
+    stream: TcpStream,
+    alpn: &[u8],
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, io::Error> {
+    let connector = TlsConnector::from(client_config_alpn(alpn)?);
     let name = ServerName::try_from("shelf-peer").map_err(io::Error::other)?;
     connector
         .connect(name, stream)
@@ -203,4 +248,31 @@ pub fn tls_exporter_client(
         .export_keying_material(&mut out, b"shelf-session-v1", None)
         .map_err(io::Error::other)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor};
+
+    use shelf_core::MAX_FRAME_BYTES;
+
+    #[tokio::test]
+    async fn json_line_helpers_roundtrip() {
+        let mut buf = Vec::new();
+        write_bounded_line(&mut buf, br#"{"op":"x"}"#)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"{\"op\":\"x\"}\n");
+        let mut cur = Cursor::new(buf);
+        let line = read_bounded_line(&mut cur).await.unwrap().unwrap();
+        assert_eq!(line, b"{\"op\":\"x\"}\n");
+    }
+
+    #[tokio::test]
+    async fn json_line_helpers_reject_oversize() {
+        let big = vec![b'a'; MAX_FRAME_BYTES + 1];
+        let err = write_bounded_line(&mut Vec::new(), &big).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 }

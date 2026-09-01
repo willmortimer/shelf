@@ -17,16 +17,19 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
+mod codec;
 mod frame;
 mod session;
 
+pub use codec::{PeerFrame, read_peer_frame, write_peer_frame};
 pub use frame::{
     OpBody, OriginCursor, PeerMessage, ReplicaFrame, SignedOperation, new_op_id, parse_sig_hex,
     sig_hex,
 };
 pub use session::{
-    SessionHello, accept_tls, connect_tls, hello_transcript, read_bounded_line,
-    tls_exporter_client, tls_exporter_server, write_bounded_line,
+    PEER_ALPN_V1, PEER_ALPN_V2, SessionHello, accept_tls, accept_tls_v2, connect_tls,
+    connect_tls_v2, hello_transcript, read_bounded_line, tls_exporter_client, tls_exporter_server,
+    write_bounded_line,
 };
 pub use shelf_mailbox::{MailboxClient, MailboxError, MailboxItem};
 pub use shelf_protocol::DeviceEpochWrap;
