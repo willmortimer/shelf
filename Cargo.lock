@@ -4243,8 +4243,10 @@ dependencies = [
 name = "shelf-client"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
+ "shelf-core",
  "thiserror 2.0.20",
  "tokio",
 ]
