@@ -205,7 +205,7 @@ fn dpapi_protect(key: &[u8; 32]) -> Result<Vec<u8>, KeystoreError> {
     use windows_sys::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
     };
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: key.len() as u32,
         pbData: key.as_ptr() as *mut u8,
     };
@@ -215,7 +215,7 @@ fn dpapi_protect(key: &[u8; 32]) -> Result<Vec<u8>, KeystoreError> {
     };
     let ok = unsafe {
         CryptProtectData(
-            &mut input,
+            &input,
             ptr::null(),
             ptr::null_mut(),
             ptr::null_mut(),
@@ -239,7 +239,7 @@ fn dpapi_unprotect(blob: &[u8]) -> Result<Vec<u8>, KeystoreError> {
     use windows_sys::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
     };
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: blob.len() as u32,
         pbData: blob.as_ptr() as *mut u8,
     };
@@ -249,7 +249,7 @@ fn dpapi_unprotect(blob: &[u8]) -> Result<Vec<u8>, KeystoreError> {
     };
     let ok = unsafe {
         CryptUnprotectData(
-            &mut input,
+            &input,
             ptr::null_mut(),
             ptr::null_mut(),
             ptr::null_mut(),
