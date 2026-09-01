@@ -53,7 +53,8 @@ impl Client {
             | IpcResponse::Latest { .. }
             | IpcResponse::Get { .. }
             | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. } => {
+            | IpcResponse::Rm { .. }
+            | IpcResponse::Scratch { .. } => {
                 Err(ClientError::Protocol("unexpected response for put".into()))
             }
         }
@@ -68,7 +69,8 @@ impl Client {
             | IpcResponse::Latest { .. }
             | IpcResponse::Get { .. }
             | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. } => {
+            | IpcResponse::Rm { .. }
+            | IpcResponse::Scratch { .. } => {
                 Err(ClientError::Protocol("unexpected response for ls".into()))
             }
         }
@@ -85,7 +87,8 @@ impl Client {
             | IpcResponse::Ls { .. }
             | IpcResponse::Get { .. }
             | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. } => Err(ClientError::Protocol(
+            | IpcResponse::Rm { .. }
+            | IpcResponse::Scratch { .. } => Err(ClientError::Protocol(
                 "unexpected response for latest".into(),
             )),
         }
@@ -100,7 +103,8 @@ impl Client {
             | IpcResponse::Ls { .. }
             | IpcResponse::Latest { .. }
             | IpcResponse::Pin { .. }
-            | IpcResponse::Rm { .. } => {
+            | IpcResponse::Rm { .. }
+            | IpcResponse::Scratch { .. } => {
                 Err(ClientError::Protocol("unexpected response for get".into()))
             }
         }
@@ -117,7 +121,8 @@ impl Client {
             | IpcResponse::Ls { .. }
             | IpcResponse::Latest { .. }
             | IpcResponse::Get { .. }
-            | IpcResponse::Rm { .. } => {
+            | IpcResponse::Rm { .. }
+            | IpcResponse::Scratch { .. } => {
                 Err(ClientError::Protocol("unexpected response for pin".into()))
             }
         }
@@ -132,9 +137,57 @@ impl Client {
             | IpcResponse::Ls { .. }
             | IpcResponse::Latest { .. }
             | IpcResponse::Get { .. }
-            | IpcResponse::Pin { .. } => {
+            | IpcResponse::Pin { .. }
+            | IpcResponse::Scratch { .. } => {
                 Err(ClientError::Protocol("unexpected response for rm".into()))
             }
+        }
+    }
+
+    /// Current plaintext of a named scratch pad.
+    pub async fn scratch_get(&self, name: &str) -> Result<String, ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::ScratchGet {
+                name: name.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::Scratch { text, .. } => Ok(text),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            IpcResponse::Put { .. }
+            | IpcResponse::Ls { .. }
+            | IpcResponse::Latest { .. }
+            | IpcResponse::Get { .. }
+            | IpcResponse::Pin { .. }
+            | IpcResponse::Rm { .. } => Err(ClientError::Protocol(
+                "unexpected response for scratch get".into(),
+            )),
+        }
+    }
+
+    /// Append `text` to a named scratch pad and return the new plaintext.
+    pub async fn scratch_append(&self, name: &str, text: &str) -> Result<String, ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::ScratchAppend {
+                name: name.to_owned(),
+                text: text.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::Scratch { text, .. } => Ok(text),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            IpcResponse::Put { .. }
+            | IpcResponse::Ls { .. }
+            | IpcResponse::Latest { .. }
+            | IpcResponse::Get { .. }
+            | IpcResponse::Pin { .. }
+            | IpcResponse::Rm { .. } => Err(ClientError::Protocol(
+                "unexpected response for scratch append".into(),
+            )),
         }
     }
 }

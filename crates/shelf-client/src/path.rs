@@ -48,6 +48,12 @@ pub fn resolve_socket_path(socket: Option<PathBuf>, home: Option<PathBuf>) -> Pa
     socket_path_in(&home.unwrap_or_else(default_shelf_home))
 }
 
+/// Shelf home from `--home` or [`default_shelf_home`].
+#[must_use]
+pub fn resolve_shelf_home(home: Option<PathBuf>) -> PathBuf {
+    home.unwrap_or_else(default_shelf_home)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

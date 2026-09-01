@@ -10,6 +10,9 @@ pub enum DaemonError {
     /// Socket or filesystem I/O.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// Identity or vault open failed.
+    #[error("{0}")]
+    Keystore(#[from] shelf_keystore::KeystoreError),
     /// Unix domain sockets are not available on this OS.
     #[error("Unix domain sockets are not supported on this operating system")]
     UnsupportedOs,

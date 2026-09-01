@@ -56,6 +56,24 @@ pub enum IpcRequest {
         #[serde(flatten)]
         target: GetTarget,
     },
+    /// Read a named scratch pad (Yrs CRDT plaintext).
+    ScratchGet {
+        /// Pad name. Defaults to `Scratch`.
+        #[serde(default = "default_scratch_name")]
+        name: String,
+    },
+    /// Append text to a named scratch pad.
+    ScratchAppend {
+        /// Pad name. Defaults to `Scratch`.
+        #[serde(default = "default_scratch_name")]
+        name: String,
+        /// Text to insert at the current end.
+        text: String,
+    },
+}
+
+fn default_scratch_name() -> String {
+    "Scratch".into()
 }
 
 impl fmt::Debug for IpcRequest {
@@ -72,6 +90,12 @@ impl fmt::Debug for IpcRequest {
             Self::Get { target } => f.debug_tuple("Get").field(target).finish(),
             Self::Pin { target } => f.debug_tuple("Pin").field(target).finish(),
             Self::Rm { target } => f.debug_tuple("Rm").field(target).finish(),
+            Self::ScratchGet { name } => f.debug_tuple("ScratchGet").field(name).finish(),
+            Self::ScratchAppend { name, text } => f
+                .debug_struct("ScratchAppend")
+                .field("name", name)
+                .field("text_len", &text.len())
+                .finish(),
         }
     }
 }
@@ -141,6 +165,13 @@ pub enum IpcResponse {
         /// Object id that was removed.
         id: ObjectId,
     },
+    /// Successful scratch read or append.
+    Scratch {
+        /// Pad name.
+        name: String,
+        /// Current pad plaintext.
+        text: String,
+    },
     /// Typed failure.
     Error {
         /// Stable error class.
@@ -173,6 +204,11 @@ impl fmt::Debug for IpcResponse {
                 .finish(),
             Self::Pin { id } => f.debug_struct("Pin").field("id", id).finish(),
             Self::Rm { id } => f.debug_struct("Rm").field("id", id).finish(),
+            Self::Scratch { name, text } => f
+                .debug_struct("Scratch")
+                .field("name", name)
+                .field("text_len", &text.len())
+                .finish(),
             Self::Error { code, message } => f
                 .debug_struct("Error")
                 .field("code", code)

@@ -22,6 +22,7 @@ shelf-core.workspace = true
 shelf-keystore.workspace = true
 shelf-protocol.workspace = true
 shelf-store.workspace = true
+shelf-transport.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

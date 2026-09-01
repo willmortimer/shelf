@@ -19,5 +19,5 @@ pub use ipc::{
 };
 pub use path::{
     RUNTIME_DIR_NAME, SOCKET_FILE_NAME, default_shelf_home, default_socket_path,
-    resolve_socket_path, socket_path_in,
+    resolve_shelf_home, resolve_socket_path, socket_path_in,
 };

@@ -144,3 +144,20 @@ async fn pin_then_ls_and_rm_then_not_found() {
     let _ = server.await;
     let _ = std::fs::remove_file(&sock);
 }
+
+#[tokio::test]
+async fn scratch_round_trip() {
+    let sock = temp_socket_path();
+    let _ = std::fs::remove_file(&sock);
+    let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+    let client = wait_for_client(&sock).await;
+
+    let text = client.scratch_append("Scratch", "hello ").await.unwrap();
+    assert_eq!(text, "hello ");
+    let again = client.scratch_get("Scratch").await.unwrap();
+    assert_eq!(again, "hello ");
+
+    server.abort();
+    let _ = server.await;
+    let _ = std::fs::remove_file(&sock);
+}

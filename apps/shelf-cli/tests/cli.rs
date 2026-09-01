@@ -22,7 +22,9 @@ fn help_lists_core_commands() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    for cmd in ["put", "latest", "ls", "get", "pin", "rm"] {
+    for cmd in [
+        "put", "latest", "ls", "get", "pin", "rm", "init", "enroll", "scratch", "capture",
+    ] {
         assert!(
             text.contains(cmd),
             "expected {cmd} in --help output:\n{text}"
@@ -192,8 +194,126 @@ mod ipc {
         let _ = server.await;
         let _ = std::fs::remove_file(&sock);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scratch_append_then_print() {
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        assert_success(&run(&sock, &["scratch", "--append", "hello"]));
+        let shown = run(&sock, &["scratch"]);
+        assert_success(&shown);
+        assert_eq!(shown.stdout, b"hello");
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_file_reassembles() {
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.bin");
+        std::fs::write(&path, b"file-bytes").unwrap();
+        assert_success(&run(&sock, &["put", "--file", path.to_str().unwrap()]));
+        let get = run(&sock, &["get", "1"]);
+        assert_success(&get);
+        assert_eq!(get.stdout, b"file-bytes");
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
 }
 
 fn stderr_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn init_export_approve_import_two_homes() {
+    let member = tempfile::tempdir().unwrap();
+    let joiner = tempfile::tempdir().unwrap();
+    let join = joiner.path().join("device.shelfjoin");
+    let grant = member.path().join("device.shelfgrant");
+
+    let init_m = Command::new(bin())
+        .args([
+            "--home",
+            member.path().to_str().unwrap(),
+            "init",
+            "--name",
+            "mac",
+        ])
+        .output()
+        .unwrap();
+    assert!(init_m.status.success(), "{}", stderr_str(&init_m));
+
+    let init_j = Command::new(bin())
+        .args([
+            "--home",
+            joiner.path().to_str().unwrap(),
+            "init",
+            "--name",
+            "linux",
+        ])
+        .output()
+        .unwrap();
+    assert!(init_j.status.success(), "{}", stderr_str(&init_j));
+
+    let export = Command::new(bin())
+        .args([
+            "--home",
+            joiner.path().to_str().unwrap(),
+            "enroll",
+            "export",
+            "--out",
+            join.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(export.status.success(), "{}", stderr_str(&export));
+    let sas_j = stderr_str(&export);
+    assert!(sas_j.contains("SAS:"), "{sas_j}");
+
+    let approve = Command::new(bin())
+        .args([
+            "--home",
+            member.path().to_str().unwrap(),
+            "enroll",
+            "approve",
+            "--join",
+            join.to_str().unwrap(),
+            "--out",
+            grant.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(approve.status.success(), "{}", stderr_str(&approve));
+    let sas_m = stderr_str(&approve);
+    assert!(sas_m.contains("SAS:"), "{sas_m}");
+
+    let import = Command::new(bin())
+        .args([
+            "--home",
+            joiner.path().to_str().unwrap(),
+            "enroll",
+            "import",
+            "--grant",
+            grant.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(import.status.success(), "{}", stderr_str(&import));
+    assert!(join.exists());
+    assert!(grant.exists());
+    assert!(member.path().join("config.toml").exists());
+    assert!(member.path().join("state.db").exists());
 }

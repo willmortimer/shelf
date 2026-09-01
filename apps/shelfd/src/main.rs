@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use shelfd::{DaemonError, MemoryStore, resolve_socket_path, serve};
+use shelf_client::{default_shelf_home, resolve_socket_path};
+use shelf_keystore::open_or_create_vault;
+use shelfd::{DaemonError, serve_with_replica};
 
 /// Per-user Shelf replica daemon.
 #[derive(Debug, Parser)]
@@ -31,6 +33,8 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), DaemonError> {
     let args = Args::parse();
+    let home = args.home.clone().unwrap_or_else(default_shelf_home);
     let socket = resolve_socket_path(args.socket, args.home);
-    serve(socket, MemoryStore::new()).await
+    let vault = open_or_create_vault(&home, None, None)?;
+    serve_with_replica(socket, vault.store, home).await
 }

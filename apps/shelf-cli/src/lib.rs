@@ -3,13 +3,20 @@
 //! The binary is named `shelf`. This library exists so the clap surface and
 //! helpers can be unit-tested without spawning a process.
 
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
-use shelf_client::{Client, ClientError, GetTarget, ListedItem, resolve_socket_path};
+use shelf_client::{
+    Client, ClientError, GetTarget, ListedItem, resolve_shelf_home, resolve_socket_path,
+};
 use shelf_core::{ContentKind, ObjectId};
+use shelf_keystore::{
+    KeystoreError, ShelfGrant, ShelfJoin, approve_join, export_join, import_grant,
+    open_or_create_vault,
+};
 use thiserror::Error;
 
 /// Failures from CLI I/O, usage, or talking to `shelfd`.
@@ -27,6 +34,9 @@ pub enum CliError {
     /// `--json` serialization failed.
     #[error("{0}")]
     Json(#[from] serde_json::Error),
+    /// Identity or enrollment failed.
+    #[error("{0}")]
+    Keystore(#[from] KeystoreError),
 }
 
 impl CliError {
@@ -60,7 +70,22 @@ pub struct Cli {
 /// `shelf` subcommands matching the design CLI vocabulary.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Seal stdin and store it. Kind defaults to `text` if UTF-8, else `opaque-bytes`.
+    /// Create identity and vault under `--home` (or `~/.shelf`).
+    Init {
+        /// Human-readable device name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional wrap passphrase (Argon2id). File 0600 wrap is used otherwise.
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+    /// Offline enrollment via `.shelfjoin` / `.shelfgrant` files.
+    Enroll {
+        /// Enrollment action.
+        #[command(subcommand)]
+        action: EnrollAction,
+    },
+    /// Seal stdin (or `--file`) and store it. Kind defaults to `text` if UTF-8, else `opaque-bytes`.
     Put {
         /// Optional display name.
         #[arg(long)]
@@ -68,6 +93,9 @@ pub enum Command {
         /// Content kind override (`text`, `markdown`, `url`, `image`, `file`, `json`, `opaque-bytes`).
         #[arg(long, value_name = "KIND", value_parser = parse_kind)]
         kind: Option<ContentKind>,
+        /// Read bytes from this path instead of stdin. Large files are chunked at 4 MiB.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
     /// Write the newest object's plaintext to stdout (no extra newline).
     Latest,
@@ -95,18 +123,97 @@ pub enum Command {
         #[arg(value_name = "TARGET")]
         target: String,
     },
+    /// Print or append a named Yrs scratch pad.
+    Scratch {
+        /// Pad name.
+        #[arg(long, default_value = "Scratch")]
+        name: String,
+        /// Append this text (otherwise print the pad).
+        #[arg(long)]
+        append: Option<String>,
+    },
+    /// Put the current system clipboard (explicit capture, not surveillance).
+    Capture,
+}
+
+/// Offline enrollment subcommands.
+#[derive(Debug, Subcommand)]
+pub enum EnrollAction {
+    /// Write a `.shelfjoin` and print a SAS phrase on stderr.
+    Export {
+        /// Output path.
+        #[arg(long, default_value = "device.shelfjoin")]
+        out: PathBuf,
+    },
+    /// Approve a join file and write a `.shelfgrant`.
+    Approve {
+        /// Join request file.
+        #[arg(long)]
+        join: PathBuf,
+        /// Output path.
+        #[arg(long, default_value = "device.shelfgrant")]
+        out: PathBuf,
+    },
+    /// Import a grant into this device's vault.
+    Import {
+        /// Grant file.
+        #[arg(long)]
+        grant: PathBuf,
+    },
 }
 
 /// Execute a parsed `shelf` invocation.
 pub async fn run(cli: Cli) -> Result<(), CliError> {
+    let home = resolve_shelf_home(cli.home.clone());
     let socket = resolve_socket_path(cli.socket, cli.home);
     match cli.command {
-        Command::Put { name, kind } => cmd_put(&socket, name, kind).await,
+        Command::Init { name, passphrase } => cmd_init(&home, name, passphrase),
+        Command::Enroll { action } => cmd_enroll(&home, action),
+        Command::Put { name, kind, file } => cmd_put(&socket, name, kind, file).await,
         Command::Latest => cmd_latest(&socket).await,
         Command::Ls { json } => cmd_ls(&socket, json).await,
         Command::Get { target } => cmd_get(&socket, &target).await,
         Command::Pin { target } => cmd_pin(&socket, &target).await,
         Command::Rm { target } => cmd_rm(&socket, &target).await,
+        Command::Scratch { name, append } => cmd_scratch(&socket, &name, append).await,
+        Command::Capture => cmd_capture(&socket).await,
+    }
+}
+
+fn cmd_init(home: &Path, name: Option<String>, passphrase: Option<String>) -> Result<(), CliError> {
+    let vault = open_or_create_vault(home, name.as_deref(), passphrase.as_deref())?;
+    writeln!(io::stdout(), "{}", vault.keys.public_identity().device_id)?;
+    Ok(())
+}
+
+fn cmd_enroll(home: &Path, action: EnrollAction) -> Result<(), CliError> {
+    match action {
+        EnrollAction::Export { out } => {
+            let vault = open_or_create_vault(home, None, None)?;
+            let (join, sas) = export_join(&vault, Vec::new())?;
+            fs::write(&out, serde_json::to_vec_pretty(&join)?)?;
+            writeln!(io::stderr(), "SAS: {sas}")?;
+            writeln!(io::stderr(), "wrote {}", out.display())?;
+            Ok(())
+        }
+        EnrollAction::Approve { join, out } => {
+            let vault = open_or_create_vault(home, None, None)?;
+            let body = fs::read(&join)?;
+            let join: ShelfJoin = serde_json::from_slice(&body)?;
+            let (grant, sas) = approve_join(&vault, &join)?;
+            fs::write(&out, serde_json::to_vec_pretty(&grant)?)?;
+            writeln!(io::stderr(), "SAS: {sas}")?;
+            writeln!(io::stderr(), "wrote {}", out.display())?;
+            Ok(())
+        }
+        EnrollAction::Import { grant } => {
+            let mut vault = open_or_create_vault(home, None, None)?;
+            let body = fs::read(&grant)?;
+            let grant: ShelfGrant = serde_json::from_slice(&body)?;
+            import_grant(&mut vault, &grant)?;
+            writeln!(io::stderr(), "imported grant")?;
+            Ok(())
+        }
     }
 }
 
@@ -114,10 +221,20 @@ async fn cmd_put(
     socket: &Path,
     name: Option<String>,
     kind: Option<ContentKind>,
+    file: Option<PathBuf>,
 ) -> Result<(), CliError> {
-    let mut bytes = Vec::new();
-    io::stdin().read_to_end(&mut bytes)?;
-    let kind = kind.unwrap_or_else(|| infer_kind(&bytes));
+    let (bytes, default_kind, default_name) = if let Some(path) = file {
+        let bytes = fs::read(&path)?;
+        let default_name = path.file_name().and_then(|s| s.to_str()).map(str::to_owned);
+        (bytes, ContentKind::File, default_name)
+    } else {
+        let mut bytes = Vec::new();
+        io::stdin().read_to_end(&mut bytes)?;
+        let kind = infer_kind(&bytes);
+        (bytes, kind, None)
+    };
+    let name = name.or(default_name);
+    let kind = kind.unwrap_or(default_kind);
     let client = Client::connect(socket).await?;
     let result = client.put(&bytes, kind, name.as_deref()).await?;
     writeln!(io::stdout(), "{}", result.id)?;
@@ -161,6 +278,79 @@ async fn cmd_rm(socket: &Path, target: &str) -> Result<(), CliError> {
     let client = Client::connect(socket).await?;
     let _id = client.rm(parse_target(target)?).await?;
     Ok(())
+}
+
+async fn cmd_scratch(socket: &Path, name: &str, append: Option<String>) -> Result<(), CliError> {
+    let client = Client::connect(socket).await?;
+    let text = if let Some(append) = append {
+        client.scratch_append(name, &append).await?
+    } else {
+        client.scratch_get(name).await?
+    };
+    write_stdout(text.as_bytes())
+}
+
+async fn cmd_capture(socket: &Path) -> Result<(), CliError> {
+    let bytes = read_clipboard()?;
+    if bytes.is_empty() {
+        return Err(CliError::Usage("clipboard is empty".into()));
+    }
+    let kind = infer_kind(&bytes);
+    let client = Client::connect(socket).await?;
+    let result = client.put(&bytes, kind, Some("clipboard")).await?;
+    writeln!(io::stdout(), "{}", result.id)?;
+    Ok(())
+}
+
+fn read_clipboard() -> Result<Vec<u8>, CliError> {
+    let output = clipboard_paste_command()
+        .ok_or_else(|| CliError::Usage("no clipboard tool on this platform".into()))?
+        .output()?;
+    if !output.status.success() {
+        return Err(CliError::Usage(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Copy bytes to the system clipboard (used by the desktop palette).
+pub fn write_clipboard(bytes: &[u8]) -> Result<(), CliError> {
+    let mut cmd = clipboard_copy_command()
+        .ok_or_else(|| CliError::Usage("no clipboard tool on this platform".into()))?;
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::null());
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(bytes)?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(CliError::Usage("clipboard copy failed".into()));
+    }
+    Ok(())
+}
+
+fn clipboard_paste_command() -> Option<ProcessCommand> {
+    if cfg!(target_os = "macos") {
+        Some(ProcessCommand::new("pbpaste"))
+    } else if cfg!(target_os = "linux") {
+        let mut cmd = ProcessCommand::new("wl-paste");
+        cmd.arg("--no-newline");
+        Some(cmd)
+    } else {
+        None
+    }
+}
+
+fn clipboard_copy_command() -> Option<ProcessCommand> {
+    if cfg!(target_os = "macos") {
+        Some(ProcessCommand::new("pbcopy"))
+    } else if cfg!(target_os = "linux") {
+        Some(ProcessCommand::new("wl-copy"))
+    } else {
+        None
+    }
 }
 
 fn write_stdout(bytes: &[u8]) -> Result<(), CliError> {

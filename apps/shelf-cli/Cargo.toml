@@ -18,8 +18,10 @@ clap.workspace = true
 serde_json.workspace = true
 shelf-client.workspace = true
 shelf-core.workspace = true
+shelf-keystore.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 shelfd = { path = "../shelfd" }
+tempfile = "3.23.0"
