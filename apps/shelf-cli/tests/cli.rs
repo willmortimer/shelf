@@ -231,6 +231,36 @@ mod ipc {
         let _ = server.await;
         let _ = std::fs::remove_file(&sock);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enroll_refuses_when_daemon_is_up() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        let out = Command::new(bin())
+            .args([
+                "--home",
+                home.path().to_str().unwrap(),
+                "--socket",
+                sock.to_str().unwrap(),
+                "enroll",
+                "export",
+                "--out",
+                home.path().join("x.shelfjoin").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("shelfd is running"), "stderr={err}");
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
 }
 
 fn stderr_str(output: &Output) -> String {

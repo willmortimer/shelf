@@ -1,5 +1,6 @@
 //! Offline file enrollment: `.shelfjoin` / `.shelfgrant`.
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use shelf_core::enrollment::{
     DeviceCapabilities, ENROLLMENT_PROTOCOL_VERSION, EncryptedMembershipState,
@@ -69,12 +70,14 @@ pub fn approve_join(
     vault: &Vault,
     join: &ShelfJoin,
 ) -> Result<(ShelfGrant, String), KeystoreError> {
+    verify_join(join)?;
     let sas =
         sas_display(&serde_json::to_vec(join).map_err(|e| KeystoreError::Identity(e.to_string()))?);
     let wrap = wrap_epoch_key(vault.store.epoch_key().as_bytes(), &join.request.kem_pubkey)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     let envelope_bytes =
         serde_json::to_vec(&wrap).map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    let issuer_id = vault.keys.public_identity();
     let mut cert = MembershipCertificate {
         vault_id: vault.store.vault_id(),
         device_id: join.request.device_id,
@@ -84,7 +87,8 @@ pub fn approve_join(
         capabilities: join.request.capabilities.clone(),
         serial: 1,
         epoch: vault.store.epoch(),
-        issuer: vault.keys.public_identity().device_id,
+        issuer: issuer_id.device_id,
+        issuer_signing_pubkey: issuer_id.signing_pubkey,
         issued_at: Timestamp::now(),
         expires_at: None,
         issuer_signature: SignatureBytes::from_bytes([0; 64]),
@@ -104,8 +108,9 @@ pub fn approve_join(
     Ok((ShelfGrant { version: 1, grant }, sas))
 }
 
-/// Import a grant into the joining vault, replacing the local epoch key.
+/// Import a grant into the joining vault, replacing the local epoch key and vault id.
 pub fn import_grant(vault: &mut Vault, grant: &ShelfGrant) -> Result<(), KeystoreError> {
+    verify_grant(vault, grant)?;
     let wrap: shelf_protocol::HybridEpochWrap =
         serde_json::from_slice(grant.grant.key_envelope.as_bytes())
             .map_err(|e| KeystoreError::Identity(e.to_string()))?;
@@ -126,6 +131,58 @@ pub fn import_grant(vault: &mut Vault, grant: &ShelfGrant) -> Result<(), Keystor
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     vault
         .store
-        .adopt_epoch_key(shelf_protocol::EpochKey::from_bytes(epoch));
+        .adopt_membership(
+            shelf_protocol::EpochKey::from_bytes(epoch),
+            grant.grant.certificate.epoch,
+            grant.grant.certificate.vault_id,
+        )
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?;
     Ok(())
+}
+
+fn verify_join(join: &ShelfJoin) -> Result<(), KeystoreError> {
+    if join.request.expires_at.as_millis() < Timestamp::now().as_millis() {
+        return Err(KeystoreError::Signature(
+            "enrollment request expired".into(),
+        ));
+    }
+    let mut unsigned = join.request.clone();
+    unsigned.self_signature = SignatureBytes::from_bytes([0; 64]);
+    let body = serde_json::to_vec(&unsigned).map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    verify_ed25519(
+        &join.request.signing_pubkey,
+        &body,
+        &join.request.self_signature,
+    )
+}
+
+fn verify_grant(vault: &Vault, grant: &ShelfGrant) -> Result<(), KeystoreError> {
+    let cert = &grant.grant.certificate;
+    let local = vault.keys.public_identity();
+    if cert.device_id != local.device_id {
+        return Err(KeystoreError::Signature(
+            "grant is not for this device".into(),
+        ));
+    }
+    if cert.signing_pubkey != local.signing_pubkey {
+        return Err(KeystoreError::Signature(
+            "grant signing key does not match this device".into(),
+        ));
+    }
+    let mut unsigned = cert.clone();
+    unsigned.issuer_signature = SignatureBytes::from_bytes([0; 64]);
+    let body = serde_json::to_vec(&unsigned).map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    verify_ed25519(&cert.issuer_signing_pubkey, &body, &cert.issuer_signature)
+}
+
+fn verify_ed25519(
+    pk: &shelf_core::SigningPublicKey,
+    msg: &[u8],
+    sig: &SignatureBytes,
+) -> Result<(), KeystoreError> {
+    let vk = VerifyingKey::try_from(*pk)
+        .map_err(|_| KeystoreError::Signature("invalid verifying key".into()))?;
+    let signature = Signature::from_bytes(sig.as_bytes());
+    vk.verify_strict(msg, &signature)
+        .map_err(|_| KeystoreError::Signature("invalid signature".into()))
 }

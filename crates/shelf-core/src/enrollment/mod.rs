@@ -184,6 +184,8 @@ pub struct MembershipCertificate {
     pub epoch: EpochId,
     /// Issuing device identity.
     pub issuer: DeviceId,
+    /// Issuer signing public key (needed to verify [`Self::issuer_signature`]).
+    pub issuer_signing_pubkey: SigningPublicKey,
     /// Issue time.
     pub issued_at: Timestamp,
     /// Optional certificate expiration.

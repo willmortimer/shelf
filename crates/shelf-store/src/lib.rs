@@ -195,6 +195,72 @@ impl SqliteStore {
         self.epoch_key = epoch_key;
     }
 
+    /// Persist vault id and epoch from a membership grant, plus the in-memory epoch key.
+    pub fn adopt_membership(
+        &mut self,
+        epoch_key: EpochKey,
+        epoch: EpochId,
+        vault_id: VaultId,
+    ) -> Result<(), StoreError> {
+        self.epoch_key = epoch_key;
+        self.epoch = epoch;
+        self.vault_id = vault_id;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('epoch', ?1)",
+            params![epoch.as_u64().to_le_bytes().as_slice()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('vault_id', ?1)",
+            params![vault_id.as_bytes().as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Tombstones for replica fan-out.
+    pub fn export_tombstones(&self) -> Result<Vec<(ObjectId, Timestamp)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT object_id, effective_at FROM tombstones")?;
+        let rows = stmt.query_map([], |row| {
+            let id: Vec<u8> = row.get(0)?;
+            let at: i64 = row.get(1)?;
+            Ok((id, at))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, at) = row?;
+            if let Ok(oid) = id_from_vec(&id) {
+                out.push((oid, Timestamp::from_millis(millis_from_sql(at))));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply a peer tombstone even if the object was never seen locally.
+    pub fn apply_tombstone(&mut self, id: ObjectId, at: Timestamp) -> Result<(), StoreError> {
+        let _ = self.conn.execute(
+            "DELETE FROM objects WHERE object_id = ?1",
+            params![id.as_bytes().as_slice()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tombstones(object_id, effective_at) VALUES (?1, ?2)",
+            params![id.as_bytes().as_slice(), at.as_millis() as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Pin by object id (replica / signed op).
+    pub fn pin_id(&mut self, id: ObjectId) -> Result<(), StoreError> {
+        let n = self.conn.execute(
+            "UPDATE objects SET pinned = 1, expires_at = NULL WHERE object_id = ?1",
+            params![id.as_bytes().as_slice()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     /// Persist the wrapped epoch-key blob (keystore ciphertext).
     pub fn save_wrapped_epoch_key(&self, blob: &[u8]) -> Result<(), StoreError> {
         self.conn.execute(
@@ -926,5 +992,29 @@ mod tests {
             !json.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             "file plaintext must not appear in the object envelope"
         );
+    }
+
+    #[test]
+    fn adopt_membership_persists_vault_and_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let epoch_key = EpochKey::new();
+        let key_bytes = *epoch_key.as_bytes();
+        let mut store = SqliteStore::open(
+            &path,
+            epoch_key,
+            DeviceId::new(),
+            EpochId::new(1),
+            VaultId::new(),
+        )
+        .unwrap();
+        let new_vault = VaultId::new();
+        store
+            .adopt_membership(EpochKey::from_bytes(key_bytes), EpochId::new(9), new_vault)
+            .unwrap();
+        drop(store);
+        let loaded = SqliteStore::load_identity(&path).unwrap().unwrap();
+        assert_eq!(loaded.1, EpochId::new(9));
+        assert_eq!(loaded.2, new_vault);
     }
 }

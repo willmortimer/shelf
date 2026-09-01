@@ -168,7 +168,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     let socket = resolve_socket_path(cli.socket, cli.home);
     match cli.command {
         Command::Init { name, passphrase } => cmd_init(&home, name, passphrase),
-        Command::Enroll { action } => cmd_enroll(&home, action),
+        Command::Enroll { action } => cmd_enroll(&home, &socket, action),
         Command::Put { name, kind, file } => cmd_put(&socket, name, kind, file).await,
         Command::Latest => cmd_latest(&socket).await,
         Command::Ls { json } => cmd_ls(&socket, json).await,
@@ -186,7 +186,8 @@ fn cmd_init(home: &Path, name: Option<String>, passphrase: Option<String>) -> Re
     Ok(())
 }
 
-fn cmd_enroll(home: &Path, action: EnrollAction) -> Result<(), CliError> {
+fn cmd_enroll(home: &Path, socket: &Path, action: EnrollAction) -> Result<(), CliError> {
+    refuse_if_daemon_running(socket)?;
     match action {
         EnrollAction::Export { out } => {
             let vault = open_or_create_vault(home, None, None)?;
@@ -215,6 +216,26 @@ fn cmd_enroll(home: &Path, action: EnrollAction) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+fn refuse_if_daemon_running(socket: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return Err(CliError::Usage(
+                "shelfd is running; stop it before `shelf enroll` (file enrollment cannot share state.db with the daemon yet)".into(),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if std::fs::File::open(socket).is_ok() {
+            return Err(CliError::Usage(
+                "shelfd is running; stop it before `shelf enroll` (file enrollment cannot share state.db with the daemon yet)".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_put(

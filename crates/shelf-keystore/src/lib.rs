@@ -44,6 +44,9 @@ pub enum KeystoreError {
     /// Identity bytes were not valid key material.
     #[error("invalid key material: {0}")]
     Identity(String),
+    /// Enrollment request or grant signature was invalid or expired.
+    #[error("enrollment signature: {0}")]
+    Signature(String),
 }
 
 /// How the local wrap key is held.
@@ -384,6 +387,8 @@ mod tests {
         let (grant, sas_b) = crate::approve_join(&member, &join).unwrap();
         assert_eq!(sas_a, sas_b);
         crate::import_grant(&mut joiner, &grant).unwrap();
+        assert_eq!(joiner.store.vault_id(), member.store.vault_id());
+        assert_eq!(joiner.store.epoch(), member.store.epoch());
         let payload = b"from-member";
         let (id, created) = member
             .store
@@ -404,5 +409,28 @@ mod tests {
             .unwrap();
         let opened = joiner.store.get(&shelf_store::ItemTarget::Id(id)).unwrap();
         assert_eq!(opened.bytes, payload);
+    }
+
+    #[test]
+    fn approve_rejects_tampered_join_signature() {
+        let member_dir = tempfile::tempdir().unwrap();
+        let join_dir = tempfile::tempdir().unwrap();
+        let member = crate::open_or_create_vault(member_dir.path(), Some("mac"), None).unwrap();
+        let joiner = crate::open_or_create_vault(join_dir.path(), Some("linux"), None).unwrap();
+        let (mut join, _) = crate::export_join(&joiner, Vec::new()).unwrap();
+        join.request.device_name = "attacker".into();
+        assert!(crate::approve_join(&member, &join).is_err());
+    }
+
+    #[test]
+    fn import_rejects_tampered_grant_signature() {
+        let member_dir = tempfile::tempdir().unwrap();
+        let join_dir = tempfile::tempdir().unwrap();
+        let member = crate::open_or_create_vault(member_dir.path(), Some("mac"), None).unwrap();
+        let mut joiner = crate::open_or_create_vault(join_dir.path(), Some("linux"), None).unwrap();
+        let (join, _) = crate::export_join(&joiner, Vec::new()).unwrap();
+        let (mut grant, _) = crate::approve_join(&member, &join).unwrap();
+        grant.grant.certificate.serial = 99;
+        assert!(crate::import_grant(&mut joiner, &grant).is_err());
     }
 }
