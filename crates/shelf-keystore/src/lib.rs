@@ -9,7 +9,8 @@ mod platform;
 mod vault;
 
 pub use enroll::{
-    ShelfGrant, ShelfJoin, approve_join, ensure_local_root, export_join, grant_sas, import_grant,
+    ShelfGrant, ShelfJoin, approve_join, approve_join_store, ensure_local_root, export_join,
+    export_join_store, grant_sas, import_grant, import_grant_store,
 };
 pub use vault::{Vault, ensure_home_layout, open_or_create_vault, revoke_device};
 

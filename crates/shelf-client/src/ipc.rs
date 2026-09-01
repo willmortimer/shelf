@@ -81,6 +81,20 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mime: Option<String>,
     },
+    /// Export a `.shelfjoin` from the daemon's open vault.
+    EnrollExport,
+    /// Approve a `.shelfjoin` using the daemon's open vault.
+    EnrollApprove {
+        /// Parsed `.shelfjoin` JSON (public enrollment request).
+        join: serde_json::Value,
+    },
+    /// Import a `.shelfgrant` into the daemon's open vault.
+    EnrollImport {
+        /// Parsed `.shelfgrant` JSON.
+        grant: serde_json::Value,
+        /// Caller-confirmed two-way SAS.
+        expect_sas: String,
+    },
 }
 
 fn default_scratch_name() -> String {
@@ -117,6 +131,9 @@ impl fmt::Debug for IpcRequest {
                 .field("filename", filename)
                 .field("mime", mime)
                 .finish(),
+            Self::EnrollExport => write!(f, "EnrollExport"),
+            Self::EnrollApprove { .. } => write!(f, "EnrollApprove"),
+            Self::EnrollImport { .. } => write!(f, "EnrollImport"),
         }
     }
 }
@@ -193,6 +210,22 @@ pub enum IpcResponse {
         /// Current pad plaintext.
         text: String,
     },
+    /// Successful enroll export.
+    EnrollExport {
+        /// `.shelfjoin` JSON to write on the client.
+        join: serde_json::Value,
+        /// Human-verifiable SAS (print on stderr).
+        sas: String,
+    },
+    /// Successful enroll approve.
+    EnrollApprove {
+        /// `.shelfgrant` JSON to write on the client.
+        grant: serde_json::Value,
+        /// Two-way SAS (print on stderr).
+        sas: String,
+    },
+    /// Successful enroll import.
+    EnrollImport,
     /// Typed failure.
     Error {
         /// Stable error class.
@@ -230,6 +263,13 @@ impl fmt::Debug for IpcResponse {
                 .field("name", name)
                 .field("text_len", &text.len())
                 .finish(),
+            Self::EnrollExport { sas, .. } => {
+                f.debug_struct("EnrollExport").field("sas", sas).finish()
+            }
+            Self::EnrollApprove { sas, .. } => {
+                f.debug_struct("EnrollApprove").field("sas", sas).finish()
+            }
+            Self::EnrollImport => write!(f, "EnrollImport"),
             Self::Error { code, message } => f
                 .debug_struct("Error")
                 .field("code", code)
@@ -321,6 +361,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&IpcRequest::Latest).unwrap(),
             r#"{"op":"latest"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcRequest::EnrollExport).unwrap(),
+            r#"{"op":"enroll_export"}"#
         );
     }
 

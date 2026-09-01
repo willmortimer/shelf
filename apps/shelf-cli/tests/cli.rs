@@ -39,7 +39,7 @@ mod ipc {
     use std::time::Duration;
 
     use shelf_client::Client;
-    use shelfd::{MemoryStore, serve};
+    use shelfd::{MemoryStore, serve, serve_with_replica};
 
     static SOCK_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -236,14 +236,31 @@ mod ipc {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn enroll_refuses_when_daemon_is_up() {
+    async fn enroll_export_succeeds_when_daemon_is_up() {
         let home = tempfile::tempdir().unwrap();
+        let vault = shelf_keystore::open_or_create_vault(home.path(), Some("test"), None, true)
+            .expect("open vault");
+        let base = 20_000 + (std::process::id() % 10_000) as u16;
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "lan_port = {base}\npeer_port = {}\n",
+                base.saturating_add(1)
+            ),
+        )
+        .unwrap();
         let sock = temp_socket_path();
         let _ = std::fs::remove_file(&sock);
-        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        let server = tokio::spawn(serve_with_replica(
+            sock.clone(),
+            vault.store,
+            home.path().to_path_buf(),
+            vault.keys,
+        ));
         wait_for_socket(&sock).await;
 
-        let out = Command::new(bin())
+        let out = home.path().join("x.shelfjoin");
+        let export = Command::new(bin())
             .args([
                 "--home",
                 home.path().to_str().unwrap(),
@@ -252,13 +269,14 @@ mod ipc {
                 "enroll",
                 "export",
                 "--out",
-                home.path().join("x.shelfjoin").to_str().unwrap(),
+                out.to_str().unwrap(),
             ])
             .output()
             .unwrap();
-        assert!(!out.status.success());
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("shelfd is running"), "stderr={err}");
+        assert_success(&export);
+        let err = String::from_utf8_lossy(&export.stderr);
+        assert!(err.contains("SAS:"), "stderr={err}");
+        assert!(out.exists(), "expected join file at {}", out.display());
 
         server.abort();
         let _ = server.await;

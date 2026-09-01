@@ -178,7 +178,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             passphrase,
             allow_file_key,
         } => cmd_init(&home, name, passphrase, allow_file_key),
-        Command::Enroll { action } => cmd_enroll(&home, &socket, action),
+        Command::Enroll { action } => cmd_enroll(&home, &socket, action).await,
         Command::Put { name, kind, file } => cmd_put(&socket, name, kind, file).await,
         Command::Latest => cmd_latest(&socket).await,
         Command::Ls { json } => cmd_ls(&socket, json).await,
@@ -201,8 +201,46 @@ fn cmd_init(
     Ok(())
 }
 
-fn cmd_enroll(home: &Path, socket: &Path, action: EnrollAction) -> Result<(), CliError> {
-    refuse_if_daemon_running(socket)?;
+async fn cmd_enroll(home: &Path, socket: &Path, action: EnrollAction) -> Result<(), CliError> {
+    if Client::connect(socket).await.is_ok() {
+        cmd_enroll_ipc(socket, action).await
+    } else {
+        cmd_enroll_direct(home, action)
+    }
+}
+
+async fn cmd_enroll_ipc(socket: &Path, action: EnrollAction) -> Result<(), CliError> {
+    let client = Client::connect(socket).await?;
+    match action {
+        EnrollAction::Export { out } => {
+            let (join, sas) = client.enroll_export().await?;
+            fs::write(&out, serde_json::to_vec_pretty(&join)?)?;
+            writeln!(io::stderr(), "SAS: {sas}")?;
+            writeln!(io::stderr(), "wrote {}", out.display())?;
+            Ok(())
+        }
+        EnrollAction::Approve { join, out } => {
+            let body = fs::read(&join)?;
+            let join: serde_json::Value = serde_json::from_slice(&body)?;
+            let (grant, sas) = client.enroll_approve(join).await?;
+            fs::write(&out, serde_json::to_vec_pretty(&grant)?)?;
+            writeln!(io::stderr(), "SAS: {sas}")?;
+            writeln!(io::stderr(), "wrote {}", out.display())?;
+            Ok(())
+        }
+        EnrollAction::Import { grant, expect_sas } => {
+            let body = fs::read(&grant)?;
+            let grant: ShelfGrant = serde_json::from_slice(&body)?;
+            let confirmed = confirm_import_sas(&grant, expect_sas)?;
+            let value = serde_json::to_value(&grant)?;
+            client.enroll_import(value, &confirmed).await?;
+            writeln!(io::stderr(), "imported grant")?;
+            Ok(())
+        }
+    }
+}
+
+fn cmd_enroll_direct(home: &Path, action: EnrollAction) -> Result<(), CliError> {
     match action {
         EnrollAction::Export { out } => {
             let vault = open_or_create_vault(home, None, None, false)?;
@@ -226,29 +264,7 @@ fn cmd_enroll(home: &Path, socket: &Path, action: EnrollAction) -> Result<(), Cl
             let mut vault = open_or_create_vault(home, None, None, false)?;
             let body = fs::read(&grant)?;
             let grant: ShelfGrant = serde_json::from_slice(&body)?;
-            let sas = grant_sas(&grant.grant)?;
-            writeln!(
-                io::stderr(),
-                "Vault: {}\nApprover: {}\nSAS: {sas}",
-                grant.grant.vault_root.fingerprint(),
-                grant.grant.certificate.issuer
-            )?;
-            let confirmed = if let Some(expect) = expect_sas {
-                expect
-            } else if io::stdin().is_terminal() {
-                eprint!("Confirm SAS matches trusted device? [y/N] ");
-                io::stderr().flush()?;
-                let mut line = String::new();
-                io::stdin().read_line(&mut line)?;
-                if !line.trim().eq_ignore_ascii_case("y") {
-                    return Err(CliError::Usage("enrollment import cancelled".into()));
-                }
-                sas.clone()
-            } else {
-                return Err(CliError::Usage(
-                    "pass --expect-sas when stdin is not a TTY".into(),
-                ));
-            };
+            let confirmed = confirm_import_sas(&grant, expect_sas)?;
             import_grant(&mut vault, &grant, &confirmed)?;
             writeln!(io::stderr(), "imported grant")?;
             Ok(())
@@ -256,24 +272,30 @@ fn cmd_enroll(home: &Path, socket: &Path, action: EnrollAction) -> Result<(), Cl
     }
 }
 
-fn refuse_if_daemon_running(socket: &Path) -> Result<(), CliError> {
-    #[cfg(unix)]
-    {
-        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-            return Err(CliError::Usage(
-                "shelfd is running; stop it before `shelf enroll` (file enrollment cannot share state.db with the daemon yet)".into(),
-            ));
-        }
+fn confirm_import_sas(grant: &ShelfGrant, expect_sas: Option<String>) -> Result<String, CliError> {
+    let sas = grant_sas(&grant.grant)?;
+    writeln!(
+        io::stderr(),
+        "Vault: {}\nApprover: {}\nSAS: {sas}",
+        grant.grant.vault_root.fingerprint(),
+        grant.grant.certificate.issuer
+    )?;
+    if let Some(expect) = expect_sas {
+        return Ok(expect);
     }
-    #[cfg(windows)]
-    {
-        if std::fs::File::open(socket).is_ok() {
-            return Err(CliError::Usage(
-                "shelfd is running; stop it before `shelf enroll` (file enrollment cannot share state.db with the daemon yet)".into(),
-            ));
+    if io::stdin().is_terminal() {
+        eprint!("Confirm SAS matches trusted device? [y/N] ");
+        io::stderr().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            return Err(CliError::Usage("enrollment import cancelled".into()));
         }
+        return Ok(sas);
     }
-    Ok(())
+    Err(CliError::Usage(
+        "pass --expect-sas when stdin is not a TTY".into(),
+    ))
 }
 
 async fn cmd_put(
