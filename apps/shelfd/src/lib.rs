@@ -7,11 +7,13 @@
 #![deny(missing_docs)]
 
 mod error;
+mod passphrase;
 mod replica;
 mod serve;
 mod store;
 
 pub use error::DaemonError;
+pub use passphrase::read_passphrase;
 pub use replica::spawn_replica;
 pub use serve::{serve, serve_with_replica};
 pub use shelf_client::{
