@@ -118,3 +118,29 @@ async fn two_puts_latest_is_newest_and_ls_order() {
     let _ = server.await;
     let _ = std::fs::remove_file(&sock);
 }
+
+#[tokio::test]
+async fn pin_then_ls_and_rm_then_not_found() {
+    let sock = temp_socket_path();
+    let _ = std::fs::remove_file(&sock);
+    let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+    let client = wait_for_client(&sock).await;
+
+    let put = client
+        .put(b"pin-me", ContentKind::Text, None)
+        .await
+        .unwrap();
+    client.pin(GetTarget::Index { index: 1 }).await.unwrap();
+    let items = client.ls().await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].pinned);
+    assert_eq!(items[0].id, put.id);
+
+    client.rm(GetTarget::Id { id: put.id }).await.unwrap();
+    let err = client.get(GetTarget::Id { id: put.id }).await.unwrap_err();
+    assert!(matches!(err, ClientError::NotFound(_)));
+
+    server.abort();
+    let _ = server.await;
+    let _ = std::fs::remove_file(&sock);
+}

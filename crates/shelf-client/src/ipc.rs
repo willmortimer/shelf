@@ -44,6 +44,18 @@ pub enum IpcRequest {
         #[serde(flatten)]
         target: GetTarget,
     },
+    /// Pin an object by id or 1-based index (newest first).
+    Pin {
+        /// Id or 1-based listing index.
+        #[serde(flatten)]
+        target: GetTarget,
+    },
+    /// Remove an object by id or 1-based index (newest first).
+    Rm {
+        /// Id or 1-based listing index.
+        #[serde(flatten)]
+        target: GetTarget,
+    },
 }
 
 impl fmt::Debug for IpcRequest {
@@ -58,6 +70,8 @@ impl fmt::Debug for IpcRequest {
             Self::Ls => write!(f, "Ls"),
             Self::Latest => write!(f, "Latest"),
             Self::Get { target } => f.debug_tuple("Get").field(target).finish(),
+            Self::Pin { target } => f.debug_tuple("Pin").field(target).finish(),
+            Self::Rm { target } => f.debug_tuple("Rm").field(target).finish(),
         }
     }
 }
@@ -117,6 +131,16 @@ pub enum IpcResponse {
         #[serde(with = "b64")]
         bytes: Vec<u8>,
     },
+    /// Successful pin.
+    Pin {
+        /// Object id that is now pinned.
+        id: ObjectId,
+    },
+    /// Successful remove.
+    Rm {
+        /// Object id that was removed.
+        id: ObjectId,
+    },
     /// Typed failure.
     Error {
         /// Stable error class.
@@ -147,6 +171,8 @@ impl fmt::Debug for IpcResponse {
                 .field("kind", kind)
                 .field("bytes_len", &bytes.len())
                 .finish(),
+            Self::Pin { id } => f.debug_struct("Pin").field("id", id).finish(),
+            Self::Rm { id } => f.debug_struct("Rm").field("id", id).finish(),
             Self::Error { code, message } => f
                 .debug_struct("Error")
                 .field("code", code)
@@ -258,6 +284,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&idx).unwrap(),
             r#"{"op":"get","index":4}"#
+        );
+    }
+
+    #[test]
+    fn pin_and_rm_request_json_shape() {
+        let pin = IpcRequest::Pin {
+            target: GetTarget::Index { index: 2 },
+        };
+        assert_eq!(
+            serde_json::to_string(&pin).unwrap(),
+            r#"{"op":"pin","index":2}"#
+        );
+        let rm = IpcRequest::Rm {
+            target: GetTarget::Index { index: 5 },
+        };
+        assert_eq!(
+            serde_json::to_string(&rm).unwrap(),
+            r#"{"op":"rm","index":5}"#
         );
     }
 

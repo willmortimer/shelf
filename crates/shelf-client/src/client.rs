@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use shelf_core::ContentKind;
+use shelf_core::{ContentKind, ObjectId};
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -49,7 +49,11 @@ impl Client {
         match rpc(&self.path, &req).await? {
             IpcResponse::Put { id, created } => Ok(PutResult { id, created }),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Ls { .. } | IpcResponse::Latest { .. } | IpcResponse::Get { .. } => {
+            IpcResponse::Ls { .. }
+            | IpcResponse::Latest { .. }
+            | IpcResponse::Get { .. }
+            | IpcResponse::Pin { .. }
+            | IpcResponse::Rm { .. } => {
                 Err(ClientError::Protocol("unexpected response for put".into()))
             }
         }
@@ -60,7 +64,11 @@ impl Client {
         match rpc(&self.path, &IpcRequest::Ls).await? {
             IpcResponse::Ls { items } => Ok(items),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. } | IpcResponse::Latest { .. } | IpcResponse::Get { .. } => {
+            IpcResponse::Put { .. }
+            | IpcResponse::Latest { .. }
+            | IpcResponse::Get { .. }
+            | IpcResponse::Pin { .. }
+            | IpcResponse::Rm { .. } => {
                 Err(ClientError::Protocol("unexpected response for ls".into()))
             }
         }
@@ -73,9 +81,13 @@ impl Client {
                 Ok(ObjectPayload::from_parts(id, kind, bytes))
             }
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. } | IpcResponse::Ls { .. } | IpcResponse::Get { .. } => Err(
-                ClientError::Protocol("unexpected response for latest".into()),
-            ),
+            IpcResponse::Put { .. }
+            | IpcResponse::Ls { .. }
+            | IpcResponse::Get { .. }
+            | IpcResponse::Pin { .. }
+            | IpcResponse::Rm { .. } => Err(ClientError::Protocol(
+                "unexpected response for latest".into(),
+            )),
         }
     }
 
@@ -84,8 +96,44 @@ impl Client {
         match rpc(&self.path, &IpcRequest::Get { target }).await? {
             IpcResponse::Get { id, kind, bytes } => Ok(ObjectPayload::from_parts(id, kind, bytes)),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
-            IpcResponse::Put { .. } | IpcResponse::Ls { .. } | IpcResponse::Latest { .. } => {
+            IpcResponse::Put { .. }
+            | IpcResponse::Ls { .. }
+            | IpcResponse::Latest { .. }
+            | IpcResponse::Pin { .. }
+            | IpcResponse::Rm { .. } => {
                 Err(ClientError::Protocol("unexpected response for get".into()))
+            }
+        }
+    }
+
+    /// Pin an object by id or 1-based newest-first index.
+    ///
+    /// Pinning is durable retention: the item stays until explicitly removed.
+    pub async fn pin(&self, target: GetTarget) -> Result<ObjectId, ClientError> {
+        match rpc(&self.path, &IpcRequest::Pin { target }).await? {
+            IpcResponse::Pin { id } => Ok(id),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            IpcResponse::Put { .. }
+            | IpcResponse::Ls { .. }
+            | IpcResponse::Latest { .. }
+            | IpcResponse::Get { .. }
+            | IpcResponse::Rm { .. } => {
+                Err(ClientError::Protocol("unexpected response for pin".into()))
+            }
+        }
+    }
+
+    /// Remove an object by id or 1-based newest-first index.
+    pub async fn rm(&self, target: GetTarget) -> Result<ObjectId, ClientError> {
+        match rpc(&self.path, &IpcRequest::Rm { target }).await? {
+            IpcResponse::Rm { id } => Ok(id),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            IpcResponse::Put { .. }
+            | IpcResponse::Ls { .. }
+            | IpcResponse::Latest { .. }
+            | IpcResponse::Get { .. }
+            | IpcResponse::Pin { .. } => {
+                Err(ClientError::Protocol("unexpected response for rm".into()))
             }
         }
     }

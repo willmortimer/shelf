@@ -120,6 +120,14 @@ fn dispatch(req: IpcRequest, store: &mut MemoryStore) -> IpcResponse {
             },
             Err(err) => store_error(err),
         },
+        IpcRequest::Pin { target } => match store.pin(&target) {
+            Ok(id) => IpcResponse::Pin { id },
+            Err(err) => store_error(err),
+        },
+        IpcRequest::Rm { target } => match store.rm(&target) {
+            Ok(id) => IpcResponse::Rm { id },
+            Err(err) => store_error(err),
+        },
     }
 }
 
