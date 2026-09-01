@@ -176,7 +176,7 @@ Tailscale is the preferred default because it provides private addressing, NAT t
 
 Shelf should use the host's normal Tailscale installation and local APIs/status information rather than embedding a Go `tsnet` runtime into the Rust core.
 
-Peer sessions are rustls (`shelf/1` ALPN) with a membership hello bound to the TLS exporter. Frames are signed operations (`seq`, `op_id`, `vault_id`, `epoch`) persisted in a local op log (not a live snapshot). Tailscale IPs are handshake-or-drop: a failed membership hello never receives ciphertext. LAN UDP is discovery-only. Mailbox items must be signed operations under an opaque mailbox id (not the vault id). File chunks carry a parent object id and the parent's expiry; missing chunks are requested with `NeedChunks` and answered with `Chunk` ops. Scratch, chunks, and revocation travel as signed ops. Unsigned mailbox blobs and raw Yrs are dropped. IPC and peer frames are rejected above 8 MiB.
+Peer sessions are rustls (`shelf/1` ALPN) with a membership hello bound to the TLS exporter (the exporter is taken from the live TLS connection, never from the serialized hello). Peers exchange `Have` cursor vectors (`origin → max seq`) and send only missing signed operations. Inbound ops are verified, checked for `(origin, seq)` uniqueness and `op_id` replay, persisted as the original signed bytes, then applied. Tailscale IPs are handshake-or-drop: a failed membership hello never receives ciphertext. LAN UDP is discovery-only. Mailbox items must be signed operations deposited into each *peer's* receive mailbox using that device's write capability; a device polls only its own mailbox with a local read capability. File chunks carry a parent object id and the parent's expiry; missing chunks are requested with `NeedChunks` and answered with `Chunk` ops. Scratch edits are distinct ops (deduped by ciphertext hash). Root-only `EpochTransition` ops carry per-remaining-device hybrid wraps of the new epoch key. Networking loads member keys from a root-signed membership snapshot, not loose cert rows. Unsigned mailbox blobs and raw Yrs are dropped. IPC, mailbox, and peer frames stop reading once they would exceed 8 MiB.
 
 Shelf may inspect whether a peer path is direct or relayed to make bandwidth decisions, but Shelf E2EE is identical in either case.
 
@@ -202,12 +202,14 @@ It has no Shelf membership certificate and no vault key.
 Minimal semantics:
 
 ```text
-PUT mailbox-id object-id ciphertext ttl
-GET mailbox-id
-ACK object-id
+PUT mailbox-id write-cap object-id ciphertext ttl
+GET mailbox-id read-cap
+ACK mailbox-id read-cap object-id
 ```
 
-The current implementation is newline-delimited JSON over TCP (`shelf-mailbox`, default `127.0.0.1:8743`). Ciphertext is Base64. The mailbox never decrypts. Per-mailbox caps are 8 MiB per item, 4096 items, and 64 MiB total. The process persists ciphertext to `--data` (default `shelf-mailbox.json`); it is still not a member and still cannot enroll devices.
+Write capability is bound on first PUT; read capability is bound on first GET. Knowing a mailbox address is not enough to drain it. Each enrolled device has its own mailbox id; replicas PUT to *other* members' mailboxes and GET only their own.
+
+The current implementation is newline-delimited JSON over TCP (`shelf-mailbox`, default `127.0.0.1:8743`). Ciphertext is Base64. Lines are read a byte at a time and rejected above 8 MiB (the reader never allocates past the cap). The mailbox never decrypts. Per-mailbox caps are 8 MiB per item, 4096 items, and 64 MiB total. The process persists ciphertext to `--data` (default `shelf-mailbox.json`); it is still not a member and still cannot enroll devices.
 
 The exact API may additionally support chunk batching, size limits, quotas, and long-polling, but it should remain intentionally dumb.
 

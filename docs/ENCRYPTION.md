@@ -57,7 +57,7 @@ VaultEpochKey[18]
 ...
 ```
 
-Membership changes that remove a device cause a new epoch to be generated and distributed only to currently authorized devices. Each replica keeps a local keyring of historical epoch keys, stored as wrap-key ciphertext in `state.db` (`epoch_wraps`), so objects sealed under older epochs still open after rotation. Revoked devices are dropped from membership and do not receive the new epoch key.
+Membership changes that remove a device are a root-only `EpochTransition`: the origin must be the vault root signing key. The transition includes a new epoch, a root-signed membership snapshot, and a hybrid wrap of the new epoch key for every remaining device. Receivers unwrap their envelope, install the new epoch, retain previous epoch keys, and drop the revoked member. Each replica keeps a local keyring of historical epoch keys, stored as wrap-key ciphertext in `state.db` (`epoch_wraps`), so objects sealed under older epochs still open after rotation.
 
 ## Object keys
 
@@ -134,7 +134,7 @@ struct EncryptedObject {
 }
 ```
 
-Authenticated associated data for v2 binds object ID, protocol version, and epoch. Content class, origin, name, and created time live inside the AEAD plaintext so mailbox JSON cannot leak them.
+Authenticated associated data for v3 binds object ID, protocol version, and epoch. Content class, origin, name, created time, retention policy, and `expires_at` live inside the AEAD plaintext so mailbox JSON cannot leak them. Honest replicas independently apply the same expiry. Nonce and ciphertext are Base64 on the JSON wire (not JSON number arrays). Replica operation signatures use a canonical binary transcript (`shelf/op/v1`), not JSON serialization.
 
 ## Object IDs and deduplication
 
