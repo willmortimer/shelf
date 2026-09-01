@@ -10,10 +10,14 @@ mod aad;
 mod cipher;
 mod envelope;
 mod error;
+mod hybrid;
+mod sas;
 mod wrap;
 
 pub use envelope::{ENVELOPE_VERSION, EncryptedObject, Hash, open, seal};
 pub use error::ProtocolError;
+pub use hybrid::{HybridEpochWrap, unwrap_epoch_key, wrap_epoch_key};
+pub use sas::{sas_display, sas_words};
 pub use wrap::{DOMAIN_DEK_WRAP, EpochKey, KeyEnvelope, WRAP_VERSION, unwrap_dek, wrap_dek};
 
 #[cfg(test)]

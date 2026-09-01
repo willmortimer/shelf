@@ -8,9 +8,11 @@ publish.workspace = true
 [dependencies]
 blake3.workspace = true
 chacha20poly1305.workspace = true
+ml-kem.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shelf-core.workspace = true
 thiserror.workspace = true
+x25519-dalek.workspace = true
 zeroize.workspace = true
