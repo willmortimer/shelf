@@ -172,6 +172,8 @@ Tailscale is the preferred default because it provides private addressing, NAT t
 
 Shelf should use the host's normal Tailscale installation and local APIs/status information rather than embedding a Go `tsnet` runtime into the Rust core.
 
+Peer sessions are newline-delimited JSON `ReplicaFrame` values (objects, signed pins, signed tombstones) over TCP on `peer_port` (default 18733). Peer IPs come from `tailscale status --json`. Put/pin/rm notify the replica immediately (push-on-put); a 30s idle tick is only a backstop. Frames are accepted only when the origin is a membership-table device and the Ed25519 signature verifies.
+
 Shelf may inspect whether a peer path is direct or relayed to make bandwidth decisions, but Shelf E2EE is identical in either case.
 
 ## LAN transport

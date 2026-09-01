@@ -1,23 +1,26 @@
-//! Unix domain socket accept loop.
+//! Local IPC accept loop (Unix sockets or Windows named pipes).
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::{Arc, Mutex};
 
 use crate::error::DaemonError;
 use crate::store::MemoryStore;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::store::{ipc_target, listed};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use shelf_client::{IpcErrorCode, IpcRequest, IpcResponse};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use shelf_core::ContentKind;
-#[cfg(unix)]
+use shelf_keystore::DeviceSigner;
+#[cfg(any(unix, windows))]
 use shelf_store::StoreError;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(any(unix, windows))]
+use tokio::sync::Notify;
 
 /// Bind `socket_path` and accept newline-delimited JSON IPC connections.
 ///
@@ -25,9 +28,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// `\n`, then the connection is closed. A stale socket file is replaced.
 /// Parent directories are created if missing.
 ///
-/// On non-Unix platforms this returns [`DaemonError::UnsupportedOs`].
+/// On platforms other than Unix or Windows this returns [`DaemonError::UnsupportedOs`].
 pub async fn serve(socket_path: impl AsRef<Path>, store: MemoryStore) -> Result<(), DaemonError> {
-    serve_inner(socket_path, store, None).await
+    serve_inner(socket_path, store, None, None).await
 }
 
 /// Serve IPC and fan sealed envelopes out over configured transports.
@@ -35,23 +38,29 @@ pub async fn serve_with_replica(
     socket_path: impl AsRef<Path>,
     store: MemoryStore,
     home: std::path::PathBuf,
+    signer: DeviceSigner,
 ) -> Result<(), DaemonError> {
-    serve_inner(socket_path, store, Some(home)).await
+    serve_inner(socket_path, store, Some(home), Some(signer)).await
 }
 
 async fn serve_inner(
     socket_path: impl AsRef<Path>,
     store: MemoryStore,
     home: Option<std::path::PathBuf>,
+    signer: Option<DeviceSigner>,
 ) -> Result<(), DaemonError> {
-    #[cfg(not(unix))]
-    {
-        let _ = (socket_path.as_ref(), store, home);
-        Err(DaemonError::UnsupportedOs)
-    }
     #[cfg(unix)]
     {
-        serve_unix(socket_path.as_ref(), store, home).await
+        serve_unix(socket_path.as_ref(), store, home, signer).await
+    }
+    #[cfg(windows)]
+    {
+        serve_windows(socket_path.as_ref(), store, home, signer).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (socket_path.as_ref(), store, home, signer);
+        Err(DaemonError::UnsupportedOs)
     }
 }
 
@@ -60,6 +69,7 @@ async fn serve_unix(
     socket_path: &Path,
     store: MemoryStore,
     home: Option<std::path::PathBuf>,
+    signer: Option<DeviceSigner>,
 ) -> Result<(), DaemonError> {
     if let Some(parent) = socket_path.parent()
         && !parent.as_os_str().is_empty()
@@ -74,14 +84,16 @@ async fn serve_unix(
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
 
     let store = Arc::new(Mutex::new(store));
-    if let Some(home) = home {
-        crate::replica::spawn_replica(Arc::clone(&store), home);
+    let notify = Arc::new(Notify::new());
+    if let (Some(home), Some(signer)) = (home, signer) {
+        crate::replica::spawn_replica(Arc::clone(&store), home, Arc::clone(&notify), signer);
     }
     loop {
         let (stream, _) = listener.accept().await?;
         let store = Arc::clone(&store);
+        let notify = Arc::clone(&notify);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, store).await {
+            if let Err(err) = handle_connection(stream, store, notify).await {
                 tracing::warn!(error = %err, "ipc connection failed");
             }
         });
@@ -92,6 +104,7 @@ async fn serve_unix(
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     store: Arc<Mutex<MemoryStore>>,
+    notify: Arc<Notify>,
 ) -> Result<(), DaemonError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -103,10 +116,22 @@ async fn handle_connection(
 
     let response = match serde_json::from_str::<IpcRequest>(line.trim_end()) {
         Ok(req) => {
+            let mutated = matches!(
+                req,
+                IpcRequest::Put { .. }
+                    | IpcRequest::Pin { .. }
+                    | IpcRequest::Rm { .. }
+                    | IpcRequest::ScratchAppend { .. }
+            );
             let mut store = store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            dispatch(req, &mut store)
+            let response = dispatch(req, &mut store);
+            drop(store);
+            if mutated {
+                notify.notify_waiters();
+            }
+            response
         }
         Err(err) => IpcResponse::Error {
             code: IpcErrorCode::Decode,
@@ -121,12 +146,12 @@ async fn handle_connection(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn io_from_json(err: serde_json::Error) -> std::io::Error {
     std::io::Error::other(err)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn dispatch(req: IpcRequest, store: &mut MemoryStore) -> IpcResponse {
     match req {
         IpcRequest::Put { bytes, kind, name } => {
@@ -182,7 +207,7 @@ fn dispatch(req: IpcRequest, store: &mut MemoryStore) -> IpcResponse {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn store_error(err: StoreError) -> IpcResponse {
     match err {
         StoreError::NotFound => IpcResponse::Error {
@@ -210,4 +235,81 @@ fn store_error(err: StoreError) -> IpcResponse {
             message: err.to_string(),
         },
     }
+}
+
+#[cfg(windows)]
+async fn serve_windows(
+    pipe_path: &Path,
+    store: MemoryStore,
+    home: Option<std::path::PathBuf>,
+    signer: Option<DeviceSigner>,
+) -> Result<(), DaemonError> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let store = Arc::new(Mutex::new(store));
+    let notify = Arc::new(Notify::new());
+    if let (Some(home), Some(signer)) = (home, signer) {
+        crate::replica::spawn_replica(Arc::clone(&store), home, Arc::clone(&notify), signer);
+    }
+
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(pipe_path)?;
+    loop {
+        server.connect().await?;
+        let connected = server;
+        server = ServerOptions::new().create(pipe_path)?;
+        let store = Arc::clone(&store);
+        let notify = Arc::clone(&notify);
+        tokio::spawn(async move {
+            if let Err(err) = handle_windows_pipe(connected, store, notify).await {
+                tracing::warn!(error = %err, "ipc connection failed");
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+async fn handle_windows_pipe(
+    mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
+    store: Arc<Mutex<MemoryStore>>,
+    notify: Arc<Notify>,
+) -> Result<(), DaemonError> {
+    let mut line = String::new();
+    let n = {
+        let mut reader = BufReader::new(&mut stream);
+        reader.read_line(&mut line).await?
+    };
+    if n == 0 || line.trim().is_empty() {
+        return Ok(());
+    }
+    let response = match serde_json::from_str::<IpcRequest>(line.trim_end()) {
+        Ok(req) => {
+            let mutated = matches!(
+                req,
+                IpcRequest::Put { .. }
+                    | IpcRequest::Pin { .. }
+                    | IpcRequest::Rm { .. }
+                    | IpcRequest::ScratchAppend { .. }
+            );
+            let mut store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let response = dispatch(req, &mut store);
+            drop(store);
+            if mutated {
+                notify.notify_waiters();
+            }
+            response
+        }
+        Err(err) => IpcResponse::Error {
+            code: IpcErrorCode::Decode,
+            message: err.to_string(),
+        },
+    };
+    let mut json = serde_json::to_string(&response).map_err(io_from_json)?;
+    json.push('\n');
+    stream.write_all(json.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
 }

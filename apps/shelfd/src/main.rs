@@ -36,5 +36,6 @@ async fn run() -> Result<(), DaemonError> {
     let home = args.home.clone().unwrap_or_else(default_shelf_home);
     let socket = resolve_socket_path(args.socket, args.home);
     let vault = open_or_create_vault(&home, None, None)?;
-    serve_with_replica(socket, vault.store, home).await
+    let signer = vault.keys.device_signer();
+    serve_with_replica(socket, vault.store, home, signer).await
 }

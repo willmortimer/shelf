@@ -56,6 +56,46 @@ pub enum Custody {
     File,
     /// Argon2id-wrapped wrap key (passphrase).
     Passphrase,
+    /// Platform store: Keychain, Secret Service, or DPAPI.
+    Platform,
+}
+
+/// Replica/metadata signer. Does not include wrap keys.
+#[derive(Clone)]
+pub struct DeviceSigner {
+    device_id: DeviceId,
+    signing: SigningKey,
+}
+
+impl DeviceSigner {
+    /// Device id bound into signed replica ops.
+    #[must_use]
+    pub fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Sign `data`.
+    #[must_use]
+    pub fn sign(&self, data: &[u8]) -> [u8; 64] {
+        self.signing.sign(data).to_bytes()
+    }
+
+    /// Corresponding verifying key.
+    #[must_use]
+    pub fn verifying_key(&self) -> SigningPublicKey {
+        SigningPublicKey::from(self.signing.verifying_key())
+    }
+}
+
+/// Verify `sig` over `msg` with `pk`.
+#[must_use]
+pub fn verify_signature(pk: &SigningPublicKey, msg: &[u8], sig: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let Ok(vk) = VerifyingKey::try_from(*pk) else {
+        return false;
+    };
+    let signature = Signature::from_bytes(sig);
+    vk.verify_strict(msg, &signature).is_ok()
 }
 
 /// Opened device keystore. Secrets never appear in `Debug`.
@@ -195,6 +235,15 @@ impl DeviceKeystore {
     #[must_use]
     pub fn sign(&self, data: &[u8]) -> [u8; 64] {
         self.signing.sign(data).to_bytes()
+    }
+
+    /// Clone a signer for replica metadata ops (no wrap keys).
+    #[must_use]
+    pub fn device_signer(&self) -> DeviceSigner {
+        DeviceSigner {
+            device_id: self.identity.device_id,
+            signing: self.signing.clone(),
+        }
     }
 
     /// Wrap `secret` under the device wrap key (epoch keys, etc.).

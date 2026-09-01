@@ -8,13 +8,18 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use shelf_core::{Peer, PeerId, PeerTransport};
 use shelf_store::SealedRecord;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
+mod frame;
+
+pub use frame::{ReplicaFrame, parse_sig_hex, sig_hex};
 pub use shelf_mailbox::{MailboxClient, MailboxError, MailboxItem};
 
 /// Transport failures.
@@ -38,6 +43,8 @@ pub struct HomeConfig {
     pub mailbox_url: Option<String>,
     /// UDP port for LAN announce/object broadcast.
     pub lan_port: u16,
+    /// TCP port for framed Tailscale/LAN peer sessions.
+    pub peer_port: u16,
 }
 
 /// Parse a tiny TOML subset: `key = "value"` and `key = 123`.
@@ -46,6 +53,7 @@ pub fn parse_home_config(path: &Path) -> HomeConfig {
     let mut cfg = HomeConfig {
         mailbox_url: None,
         lan_port: 18732,
+        peer_port: 18733,
     };
     let Ok(text) = std::fs::read_to_string(path) else {
         return cfg;
@@ -69,6 +77,11 @@ pub fn parse_home_config(path: &Path) -> HomeConfig {
             "lan_port" => {
                 if let Ok(p) = val.parse() {
                     cfg.lan_port = p;
+                }
+            }
+            "peer_port" => {
+                if let Ok(p) = val.parse() {
+                    cfg.peer_port = p;
                 }
             }
             _ => {}
@@ -196,6 +209,23 @@ impl PeerTransport for TailscaleTransport {
     }
 }
 
+/// Send one newline-delimited replica frame to `addr` (Tailscale or loopback).
+pub async fn send_replica_line(addr: SocketAddr, line: &[u8]) -> Result<(), TransportError> {
+    let connect = tokio::net::TcpStream::connect(addr);
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), connect)
+        .await
+        .map_err(|_| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "peer connect timed out",
+            ))
+        })??;
+    stream.write_all(line).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 struct LanPacket {
     v: u16,
@@ -276,12 +306,13 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "mailbox_url = \"127.0.0.1:8743\"\nlan_port = 19000\n",
+            "mailbox_url = \"127.0.0.1:8743\"\nlan_port = 19000\npeer_port = 19100\n",
         )
         .unwrap();
         let cfg = parse_home_config(&path);
         assert_eq!(cfg.mailbox_url.as_deref(), Some("127.0.0.1:8743"));
         assert_eq!(cfg.lan_port, 19000);
+        assert_eq!(cfg.peer_port, 19100);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -364,5 +395,21 @@ mod tests {
         .unwrap();
         assert_eq!(b.get(&ItemTarget::Id(id)).unwrap().bytes, b"replicated");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn send_replica_line_is_newline_framed() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        send_replica_line(addr, br#"{"op":"x"}"#).await.unwrap();
+        let buf = server.await.unwrap();
+        assert_eq!(buf, b"{\"op\":\"x\"}\n");
     }
 }
