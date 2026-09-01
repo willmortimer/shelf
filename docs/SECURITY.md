@@ -86,9 +86,11 @@ Current wrap-key providers (identity secrets stay wrapped under the wrap key):
 macOS     Keychain generic password (`shelf.wrap-key`)
 Linux     Secret Service via `secret-tool`
 Windows   DPAPI blob `wrap.dpapi` (TPM-backed when the OS is)
-File      `wrap.key` mode 0600
 Passphrase Argon2id
+File      `wrap.key` mode 0600 only with `--allow-file-key` (never on iOS)
 ```
+
+`$SHELF_HOME`, `$HOME/.shelf`, or `%USERPROFILE%\.shelf` is required. There is no `./.shelf` CWD fallback. Home directories are created mode 0700.
 
 ## User presence
 
@@ -158,7 +160,7 @@ epoch 18
   Phone
 ```
 
-The removed PC may still possess old epoch material and previously decrypted content. It does not receive epoch 18 secrets and cannot decrypt newly created data.
+The removed PC may still possess old epoch material and previously decrypted content. It does not receive epoch 18 secrets and cannot decrypt newly created data. Honest replicas keep wrapped historical epoch keys locally so objects sealed under epoch 17 still open after rotation.
 
 ## Tailnet compromise resistance
 

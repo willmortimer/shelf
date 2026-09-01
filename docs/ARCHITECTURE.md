@@ -176,7 +176,7 @@ Tailscale is the preferred default because it provides private addressing, NAT t
 
 Shelf should use the host's normal Tailscale installation and local APIs/status information rather than embedding a Go `tsnet` runtime into the Rust core.
 
-Peer sessions are newline-delimited JSON `ReplicaFrame` values (objects, signed pins, signed tombstones) over TCP on `peer_port` (default 18733). Peer IPs come from `tailscale status --json`. Put/pin/rm notify the replica immediately (push-on-put); a 30s idle tick is only a backstop. Frames are accepted only when the origin is a membership-table device and the Ed25519 signature verifies.
+Peer sessions are rustls (`shelf/1` ALPN) with a membership hello bound to the TLS exporter. Frames are signed operations (`seq`, `op_id`, `vault_id`, `epoch`) persisted in a local op log (not a live snapshot). Tailscale IPs are handshake-or-drop: a failed membership hello never receives ciphertext. LAN UDP is discovery-only. Mailbox items must be signed operations under an opaque mailbox id (not the vault id). File chunks carry a parent object id and the parent's expiry; missing chunks are requested with `NeedChunks` and answered with `Chunk` ops. Scratch, chunks, and revocation travel as signed ops. Unsigned mailbox blobs and raw Yrs are dropped. IPC and peer frames are rejected above 8 MiB.
 
 Shelf may inspect whether a peer path is direct or relayed to make bandwidth decisions, but Shelf E2EE is identical in either case.
 
@@ -207,7 +207,7 @@ GET mailbox-id
 ACK object-id
 ```
 
-The current implementation is newline-delimited JSON over TCP (`shelf-mailbox`, default `127.0.0.1:8743`). Ciphertext is Base64. The mailbox never decrypts.
+The current implementation is newline-delimited JSON over TCP (`shelf-mailbox`, default `127.0.0.1:8743`). Ciphertext is Base64. The mailbox never decrypts. Per-mailbox caps are 8 MiB per item, 4096 items, and 64 MiB total. The process persists ciphertext to `--data` (default `shelf-mailbox.json`); it is still not a member and still cannot enroll devices.
 
 The exact API may additionally support chunk batching, size limits, quotas, and long-polling, but it should remain intentionally dumb.
 
@@ -289,8 +289,8 @@ Providers:
 Apple Keychain (`security` generic password; wrap key)
 Windows DPAPI (`wrap.dpapi`; TPM-backed when the OS is)
 Linux Secret Service (`secret-tool`)
-0600 `wrap.key` file fallback
-Argon2id passphrase fallback
+Argon2id passphrase
+0600 `wrap.key` only with `--allow-file-key` (never on iOS)
 ```
 
 Identity signing/KEM secrets remain wrapped under that wrap key. TPM PKCS#11 / `tpm2-tss` is not a separate provider yet.

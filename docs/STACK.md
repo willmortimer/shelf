@@ -57,8 +57,8 @@ Invariant: `shelf-core` must not depend on `shelf-mailbox`.
 
 - Local IPC: Unix domain sockets (macOS/Linux); named pipes or local IPC (Windows).
 - Userland state root: `~/.shelf/` (`config.toml`, `state.db`, objects, chunks, logs, runtime, cache, export, enrollment).
-- `shelf init` / `shelf enroll` write identity + vault under `--home` (file wrap 0600, or Argon2id with `--passphrase`). Platform custody is tried first: macOS Keychain (`security`), Linux Secret Service (`secret-tool`), Windows DPAPI (`wrap.dpapi`). File 0600 remains the fallback. `shelf enroll` must not run while `shelfd` holds `state.db`.
-- Replica fan-out: host `tailscale status --json` (no tsnet), framed TCP peer sessions on `peer_port` (default 18733), LAN UDP (`lan_port`, default 18732), optional mailbox at `mailbox_url`. Put/pin/rm notify the replica immediately; signed pin/tombstone frames keep two daemons consistent. Mailbox protocol is newline JSON PUT/GET/ACK; default listen `127.0.0.1:8743`.
+- `shelf init` / `shelf enroll` write identity + vault under `--home`. Wrap-key custody is platform store or `--passphrase`; `--allow-file-key` is required for 0600 `wrap.key`. iOS never uses file wrap. `shelf enroll` must not run while `shelfd` holds `state.db`.
+- Replica fan-out: host `tailscale status --json` (no tsnet), rustls peer sessions on `peer_port` (default 18733) carrying signed operations from a durable op log, LAN UDP discovery (`lan_port`, default 18732) without ciphertext flood, optional mailbox at `mailbox_url` (mailbox items must be signed frames). Put/pin/rm/scratch notify the replica immediately. Mailbox protocol is newline JSON PUT/GET/ACK with per-id caps; default listen `127.0.0.1:8743` and persist path `--data shelf-mailbox.json`. IPC and peer lines are bounded at 8 MiB.
 - Desktop GUI must not own a second configuration tree. `shelf-desktop` is a searchable palette (copy-on-select). Bind an OS keyboard shortcut to the `shelf-desktop` binary for a global hotkey.
 - iOS: `crates/shelf-mobile` in-process session; Swift stubs in `apps/shelf-ios/` (not a Cargo member). Windows IPC: named pipes `\\.\pipe\shelf-<hash>`.
 
@@ -77,7 +77,7 @@ Versions live in the workspace `[workspace.dependencies]` table.
 
 ## Packaging / CI
 
-Dev pin: `mise.toml` (`rust` 1.98.0 with rustfmt, clippy, rust-src). CI: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+Dev pin: `mise.toml` (`rust` 1.98.0 with rustfmt, clippy, rust-src). CI: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` on Ubuntu, macOS, and Windows. The `required` job is the merge gate. `main` should require that check before merge.
 
 ## License
 

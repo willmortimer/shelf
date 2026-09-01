@@ -36,11 +36,14 @@ The exact wire construction must be selected from a well-reviewed library/provid
 
 ## Wrap-key custody
 
-The 32-byte device wrap key protects identity secrets and the vault epoch key. Load/create order:
+The 32-byte device wrap key protects identity secrets and the vault epoch key. Create order is fail-closed:
 
 1. `--passphrase` → Argon2id (salt in `wrap.salt`)
 2. Platform store: macOS Keychain (`security`), Linux Secret Service (`secret-tool`), Windows DPAPI (`wrap.dpapi`)
-3. `~/.shelf/wrap.key` with mode 0600
+3. `--allow-file-key` → `~/.shelf/wrap.key` created with mode 0600 (unsafe hatch)
+4. Otherwise init fails. iOS never uses file wrap.
+
+Existing vaults that already have `wrap.key` still load it. Headless installs work with a platform store or a passphrase; Kage is not required.
 
 Windows DPAPI is the TPM-adjacent path when the OS binds the user logon to a TPM. There is no separate PKCS#11 / `tpm2-tss` provider yet.
 
@@ -54,7 +57,7 @@ VaultEpochKey[18]
 ...
 ```
 
-Membership changes that remove a device cause a new epoch to be generated and distributed only to currently authorized devices.
+Membership changes that remove a device cause a new epoch to be generated and distributed only to currently authorized devices. Each replica keeps a local keyring of historical epoch keys, stored as wrap-key ciphertext in `state.db` (`epoch_wraps`), so objects sealed under older epochs still open after rotation. Revoked devices are dropped from membership and do not receive the new epoch key.
 
 ## Object keys
 
@@ -131,13 +134,7 @@ struct EncryptedObject {
 }
 ```
 
-Authenticated associated data should bind security-relevant metadata such as:
-
-- object ID,
-- protocol version,
-- epoch ID,
-- content class,
-- origin device identity where required.
+Authenticated associated data for v2 binds object ID, protocol version, and epoch. Content class, origin, name, and created time live inside the AEAD plaintext so mailbox JSON cannot leak them.
 
 ## Object IDs and deduplication
 
@@ -168,10 +165,14 @@ Each chunk has:
 
 ```text
 opaque chunk ID
+parent object ID
+parent expiry
 independent nonce
 independent AEAD ciphertext
 integrity hash of ciphertext
 ```
+
+Replicas that have a file manifest but not its chunks emit a signed `NeedChunks` op; holders reply with the matching `Chunk` envelopes. GC deletes chunks when the parent is tombstoned or expired.
 
 Chunk keys may either:
 
@@ -246,7 +247,7 @@ Recovery should be versioned and rotatable.
 
 ## Forward secrecy considerations
 
-Normal peer sessions should use ephemeral session keys so compromise of a long-term identity key does not automatically expose all previously captured online traffic.
+Normal peer sessions use rustls (`shelf/1`) with a membership hello bound to the TLS exporter so compromise of a long-term identity key does not automatically expose all previously captured online traffic.
 
 Persistent object confidentiality is protected separately by object DEKs and epoch key envelopes.
 

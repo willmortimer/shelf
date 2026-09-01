@@ -11,11 +11,16 @@ env:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux GUI libs (Slint)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -44,3 +49,12 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  required:
+    name: required
+    needs: ci
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All matrix legs passed
+        run: test "${{ needs.ci.result }}" = "success"
