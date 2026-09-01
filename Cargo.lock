@@ -4551,6 +4551,7 @@ name = "shelfd"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "shelf-client",

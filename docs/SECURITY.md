@@ -194,7 +194,7 @@ Scratch pad ids are derived with a vault-keyed BLAKE3 index key, not `VaultId ||
 
 Peer TLS uses rustls/ring today (not PQ). Object encryption and enrollment wraps remain X25519 + ML-KEM-768. That is acceptable for transient sessions; the durable-data PQ layer is the one that matters.
 
-`shelfd` unlocks a passphrase vault with `--passphrase-fd` or `SHELF_PASSPHRASE` (never a passphrase argv).
+`shelfd` unlocks a passphrase vault in this order (never a passphrase argv): systemd `CREDENTIALS_DIRECTORY` file `shelf.passphrase` when that env is set and the file is non-empty; `--passphrase-fd`; `SHELF_PASSPHRASE`; a hidden (no-echo) prompt when stdin is a TTY. If none apply, vault open uses platform custody and existing `NoCustody` / keystore errors.
 
 ## Plaintext hashing
 
