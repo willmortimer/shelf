@@ -15,10 +15,13 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
-/// ALPN for newline-JSON peer sessions (legacy until replica switches).
+/// ALPN for newline-JSON peer sessions (legacy; replica peers use [`PEER_ALPN_V2`]).
 pub const PEER_ALPN_V1: &[u8] = b"shelf/1";
 /// ALPN for length-prefixed binary peer sessions ([`crate::read_peer_frame`]).
 pub const PEER_ALPN_V2: &[u8] = b"shelf/2";
+
+/// Client half of a `shelf/2` replica TLS session.
+pub type PeerClientTls = tokio_rustls::client::TlsStream<TcpStream>;
 
 /// First application record after TLS: membership binding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,9 +201,7 @@ async fn accept_tls_alpn(
 }
 
 /// Connect TLS to `stream`. Server name is unused (custom verifier).
-pub async fn connect_tls(
-    stream: TcpStream,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, io::Error> {
+pub async fn connect_tls(stream: TcpStream) -> Result<PeerClientTls, io::Error> {
     let connector = TlsConnector::from(client_config()?);
     let name = ServerName::try_from("shelf-peer").map_err(io::Error::other)?;
     connector
@@ -210,16 +211,11 @@ pub async fn connect_tls(
 }
 
 /// Connect TLS negotiating ALPN [`PEER_ALPN_V2`].
-pub async fn connect_tls_v2(
-    stream: TcpStream,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, io::Error> {
+pub async fn connect_tls_v2(stream: TcpStream) -> Result<PeerClientTls, io::Error> {
     connect_tls_alpn(stream, PEER_ALPN_V2).await
 }
 
-async fn connect_tls_alpn(
-    stream: TcpStream,
-    alpn: &[u8],
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, io::Error> {
+async fn connect_tls_alpn(stream: TcpStream, alpn: &[u8]) -> Result<PeerClientTls, io::Error> {
     let connector = TlsConnector::from(client_config_alpn(alpn)?);
     let name = ServerName::try_from("shelf-peer").map_err(io::Error::other)?;
     connector
@@ -239,9 +235,7 @@ pub fn tls_exporter_server(tls: &ServerTlsStream<TcpStream>) -> Result<[u8; 32],
 }
 
 /// TLS exporter on the client half.
-pub fn tls_exporter_client(
-    tls: &tokio_rustls::client::TlsStream<TcpStream>,
-) -> Result<[u8; 32], io::Error> {
+pub fn tls_exporter_client(tls: &PeerClientTls) -> Result<[u8; 32], io::Error> {
     let mut out = [0u8; 32];
     tls.get_ref()
         .1

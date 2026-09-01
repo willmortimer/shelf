@@ -27,9 +27,9 @@ pub use frame::{
     sig_hex,
 };
 pub use session::{
-    PEER_ALPN_V1, PEER_ALPN_V2, SessionHello, accept_tls, accept_tls_v2, connect_tls,
-    connect_tls_v2, hello_transcript, read_bounded_line, tls_exporter_client, tls_exporter_server,
-    write_bounded_line,
+    PEER_ALPN_V1, PEER_ALPN_V2, PeerClientTls, SessionHello, accept_tls, accept_tls_v2,
+    connect_tls, connect_tls_v2, hello_transcript, read_bounded_line, tls_exporter_client,
+    tls_exporter_server, write_bounded_line,
 };
 pub use shelf_mailbox::{MailboxClient, MailboxError, MailboxItem};
 pub use shelf_protocol::DeviceEpochWrap;
