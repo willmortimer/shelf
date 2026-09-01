@@ -1,14 +1,24 @@
 //! Platform wrap-key custody: Keychain, Secret Service, DPAPI.
 //!
-//! Failures are non-fatal: the caller may fall back to `--allow-file-key`.
+//! Failures are non-fatal: the caller may fall back to `--allow-file-key`
+//! (never on iOS).
 
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 use crate::KeystoreError;
+#[cfg(target_os = "ios")]
+use security_framework::passwords::{
+    PasswordOptions, generic_password, set_generic_password_options,
+};
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Generic-password service name shared by macOS (`security` CLI) and iOS
+/// (`security-framework`). Linux Secret Service uses the same string.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "ios"))]
+const WRAP_KEY_SERVICE: &str = "shelf.wrap-key";
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "ios"))]
 pub(crate) fn account_id(home: &Path) -> String {
     let h = blake3::hash(home.to_string_lossy().as_bytes());
     let hex: String = h.as_bytes()[..8]
@@ -28,11 +38,15 @@ pub(crate) fn store_wrap_key(home: &Path, key: &[u8; 32]) -> Result<bool, Keysto
     {
         linux_store(&account_id(home), &hex_key(key))
     }
+    #[cfg(target_os = "ios")]
+    {
+        ios_store(&account_id(home), &hex_key(key))
+    }
     #[cfg(windows)]
     {
         windows_store(home, key)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "ios", windows)))]
     {
         let _ = (home, key);
         Ok(false)
@@ -49,23 +63,27 @@ pub(crate) fn load_wrap_key(home: &Path) -> Result<Option<[u8; 32]>, KeystoreErr
     {
         linux_load(&account_id(home))
     }
+    #[cfg(target_os = "ios")]
+    {
+        ios_load(&account_id(home))
+    }
     #[cfg(windows)]
     {
         windows_load(home)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "ios", windows)))]
     {
         let _ = home;
         Ok(None)
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "ios"))]
 fn hex_key(key: &[u8; 32]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "ios"))]
 fn parse_hex_key(s: &str) -> Result<[u8; 32], KeystoreError> {
     let s = s.trim();
     if s.len() != 64 {
@@ -89,7 +107,7 @@ fn macos_store(account: &str, hex: &str) -> Result<bool, KeystoreError> {
             "-a",
             account,
             "-s",
-            "shelf.wrap-key",
+            WRAP_KEY_SERVICE,
             "-w",
             hex,
             "-U",
@@ -109,7 +127,7 @@ fn macos_load(account: &str) -> Result<Option<[u8; 32]>, KeystoreError> {
             "-a",
             account,
             "-s",
-            "shelf.wrap-key",
+            WRAP_KEY_SERVICE,
             "-w",
         ])
         .stdin(Stdio::null())
@@ -131,7 +149,7 @@ fn linux_store(account: &str, hex: &str) -> Result<bool, KeystoreError> {
             "store",
             "--label=Shelf wrap key",
             "service",
-            "shelf.wrap-key",
+            WRAP_KEY_SERVICE,
             "account",
             account,
         ])
@@ -152,7 +170,7 @@ fn linux_store(account: &str, hex: &str) -> Result<bool, KeystoreError> {
 #[cfg(target_os = "linux")]
 fn linux_load(account: &str) -> Result<Option<[u8; 32]>, KeystoreError> {
     let output = Command::new("secret-tool")
-        .args(["lookup", "service", "shelf.wrap-key", "account", account])
+        .args(["lookup", "service", WRAP_KEY_SERVICE, "account", account])
         .stdin(Stdio::null())
         .output();
     let Ok(output) = output else {
@@ -166,6 +184,31 @@ fn linux_load(account: &str) -> Result<Option<[u8; 32]>, KeystoreError> {
         return Ok(None);
     }
     Ok(Some(parse_hex_key(&s)?))
+}
+
+/// iOS Keychain generic password. Hardware-encrypted via Security.framework
+/// class keys (Secure Enclave–bound when the device has one). Never writes
+/// `wrap.key`. macOS still uses the `security` CLI, not this path.
+#[cfg(target_os = "ios")]
+fn ios_store(account: &str, hex: &str) -> Result<bool, KeystoreError> {
+    let mut options = PasswordOptions::new_generic_password(WRAP_KEY_SERVICE, account);
+    // Local Keychain only: wrap keys must not roam via iCloud Keychain.
+    options.set_access_synchronized(Some(false));
+    options.use_protected_keychain();
+    Ok(set_generic_password_options(hex.as_bytes(), options).is_ok())
+}
+
+#[cfg(target_os = "ios")]
+fn ios_load(account: &str) -> Result<Option<[u8; 32]>, KeystoreError> {
+    let mut options = PasswordOptions::new_generic_password(WRAP_KEY_SERVICE, account);
+    options.set_access_synchronized(Some(false));
+    options.use_protected_keychain();
+    let Ok(bytes) = generic_password(options) else {
+        return Ok(None);
+    };
+    let s = std::str::from_utf8(&bytes)
+        .map_err(|_| KeystoreError::Identity("invalid platform wrap utf8".into()))?;
+    Ok(Some(parse_hex_key(s)?))
 }
 
 #[cfg(windows)]

@@ -631,6 +631,25 @@ mod tests {
         }
     }
 
+    /// iOS must never persist `wrap.key`, even if the caller passes
+    /// `allow_file_key`. Compiled only for `target_os = "ios"`.
+    #[cfg(target_os = "ios")]
+    #[test]
+    fn ios_never_writes_file_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrap_path = dir.path().join("wrap.key");
+        match DeviceKeystore::open_or_init(dir.path(), Some("ios"), None, true) {
+            Ok(ks) => {
+                assert_eq!(ks.custody(), Custody::Platform);
+                assert!(!wrap_path.exists(), "iOS must not write wrap.key");
+            }
+            Err(KeystoreError::NoCustody) => {
+                assert!(!wrap_path.exists(), "iOS must not write wrap.key");
+            }
+            Err(other) => panic!("unexpected {other}"),
+        }
+    }
+
     #[test]
     fn vault_persists_wrapped_epoch_not_raw_key() {
         let dir = tempfile::tempdir().unwrap();

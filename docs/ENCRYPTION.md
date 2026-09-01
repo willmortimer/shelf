@@ -39,9 +39,9 @@ The exact wire construction must be selected from a well-reviewed library/provid
 The 32-byte device wrap key protects identity secrets and the vault epoch key. Create order is fail-closed:
 
 1. `--passphrase` → Argon2id (salt in `wrap.salt`)
-2. Platform store: macOS Keychain (`security`), Linux Secret Service (`secret-tool`), Windows DPAPI (`wrap.dpapi`)
+2. Platform store: macOS Keychain (`security` CLI), iOS Keychain (`security-framework`), Linux Secret Service (`secret-tool`), Windows DPAPI (`wrap.dpapi`)
 3. `--allow-file-key` → `~/.shelf/wrap.key` created with mode 0600 (unsafe hatch)
-4. Otherwise init fails. iOS never uses file wrap.
+4. Otherwise init fails. iOS never uses file wrap (`allow_file_key` stays false; Keychain or a passphrase only).
 
 Existing vaults that already have `wrap.key` still load it. Headless installs work with a platform store or a passphrase; Kage is not required.
 
@@ -214,6 +214,8 @@ encrypted device secret material
 ```
 
 The file system may contain encrypted key blobs that are useless without the TPM/Secure Enclave/Kage-controlled wrapping key.
+
+On iOS, wrap-key custody is a Keychain generic password (`service` `shelf.wrap-key`, `account` derived from the app home the same way as macOS) via the `security-framework` crate (MIT/Apache-2.0, Apple-only target dependency). The item is hardware-encrypted with Secure Enclave–bound class keys when the device has a Secure Enclave. iOS still never writes `wrap.key`. macOS continues to use the `security` CLI, not `security-framework`.
 
 ## Headless fallback
 
