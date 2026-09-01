@@ -12,7 +12,7 @@ pub const DOMAIN_OP: &str = "shelf/op/v1";
 pub const OP_TRANSCRIPT_VERSION: u16 = 1;
 
 /// One signed replica operation (canonical log entry).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedOperation {
     /// Per-origin sequence number.
     pub seq: u64,
@@ -34,7 +34,7 @@ pub struct SignedOperation {
 pub type ReplicaFrame = SignedOperation;
 
 /// Session control plus signed ops on a TLS peer stream.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PeerMessage {
     /// A signed replica operation.
@@ -50,7 +50,7 @@ pub enum PeerMessage {
 }
 
 /// Highest applied sequence for one origin.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginCursor {
     /// Origin device.
     pub origin: DeviceId,
@@ -59,7 +59,7 @@ pub struct OriginCursor {
 }
 
 /// Mutation carried by a [`SignedOperation`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OpBody {
     /// Sealed object (ciphertext only; metadata is inside the envelope).

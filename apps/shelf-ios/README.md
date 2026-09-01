@@ -18,6 +18,22 @@ Link `shelf-mobile` as a static library from the Xcode project (cargo
 `aarch64-apple-ios` / `aarch64-apple-ios-sim`). The Swift files are the
 intended call sites; they compile in Xcode, not in this Cargo workspace.
 
+## Wrap-key custody
+
+`MobileSession` opens the vault with `allow_file_key = false`. Wrap keys live
+in the iOS Keychain (`shelf.wrap-key`, same account scheme as macOS) through
+`security-framework` in `shelf-keystore`. That path is hardware-backed when
+the device has a Secure Enclave. iOS never writes `wrap.key`; a passphrase
+is the only software fallback.
+
+Host CI does not compile `target_os = "ios"`. To type-check the Keychain
+path on a Mac with the iOS SDK:
+
+```bash
+rustup target add aarch64-apple-ios
+cargo check -p shelf-keystore --target aarch64-apple-ios
+```
+
 ## Replication
 
 Replication is opportunistic: when the app or extension runs, open the vault

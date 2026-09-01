@@ -14,7 +14,12 @@ use crate::store::{ipc_target, listed};
 use shelf_client::{IpcErrorCode, IpcRequest, IpcResponse};
 #[cfg(any(unix, windows))]
 use shelf_core::ContentKind;
-use shelf_keystore::DeviceSigner;
+use shelf_keystore::DeviceKeystore;
+#[cfg(any(unix, windows))]
+use shelf_keystore::{
+    KeystoreError, ShelfGrant, ShelfJoin, approve_join_store, export_join_store,
+    export_recovery_store, import_grant_store,
+};
 #[cfg(any(unix, windows))]
 use shelf_store::StoreError;
 #[cfg(any(unix, windows))]
@@ -38,28 +43,28 @@ pub async fn serve_with_replica(
     socket_path: impl AsRef<Path>,
     store: MemoryStore,
     home: std::path::PathBuf,
-    signer: DeviceSigner,
+    keys: DeviceKeystore,
 ) -> Result<(), DaemonError> {
-    serve_inner(socket_path, store, Some(home), Some(signer)).await
+    serve_inner(socket_path, store, Some(home), Some(keys)).await
 }
 
 async fn serve_inner(
     socket_path: impl AsRef<Path>,
     store: MemoryStore,
     home: Option<std::path::PathBuf>,
-    signer: Option<DeviceSigner>,
+    keys: Option<DeviceKeystore>,
 ) -> Result<(), DaemonError> {
     #[cfg(unix)]
     {
-        serve_unix(socket_path.as_ref(), store, home, signer).await
+        serve_unix(socket_path.as_ref(), store, home, keys).await
     }
     #[cfg(windows)]
     {
-        serve_windows(socket_path.as_ref(), store, home, signer).await
+        serve_windows(socket_path.as_ref(), store, home, keys).await
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (socket_path.as_ref(), store, home, signer);
+        let _ = (socket_path.as_ref(), store, home, keys);
         Err(DaemonError::UnsupportedOs)
     }
 }
@@ -69,7 +74,7 @@ async fn serve_unix(
     socket_path: &Path,
     store: MemoryStore,
     home: Option<std::path::PathBuf>,
-    signer: Option<DeviceSigner>,
+    keys: Option<DeviceKeystore>,
 ) -> Result<(), DaemonError> {
     if let Some(parent) = socket_path.parent()
         && !parent.as_os_str().is_empty()
@@ -85,15 +90,22 @@ async fn serve_unix(
 
     let store = Arc::new(Mutex::new(store));
     let notify = Arc::new(Notify::new());
-    if let (Some(home), Some(signer)) = (home, signer) {
-        crate::replica::spawn_replica(Arc::clone(&store), home, Arc::clone(&notify), signer);
+    let keys = keys.map(Arc::new);
+    if let (Some(home), Some(keys)) = (home, keys.as_ref()) {
+        crate::replica::spawn_replica(
+            Arc::clone(&store),
+            home,
+            Arc::clone(&notify),
+            keys.device_signer(),
+        );
     }
     loop {
         let (stream, _) = listener.accept().await?;
         let store = Arc::clone(&store);
         let notify = Arc::clone(&notify);
+        let keys = keys.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, store, notify).await {
+            if let Err(err) = handle_connection(stream, store, notify, keys).await {
                 tracing::warn!(error = %err, "ipc connection failed");
             }
         });
@@ -105,6 +117,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     store: Arc<Mutex<MemoryStore>>,
     notify: Arc<Notify>,
+    keys: Option<Arc<DeviceKeystore>>,
 ) -> Result<(), DaemonError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = reader;
@@ -117,18 +130,11 @@ async fn handle_connection(
 
     let response = match serde_json::from_str::<IpcRequest>(line.trim_end()) {
         Ok(req) => {
-            let mutated = matches!(
-                req,
-                IpcRequest::Put { .. }
-                    | IpcRequest::PutFile { .. }
-                    | IpcRequest::Pin { .. }
-                    | IpcRequest::Rm { .. }
-                    | IpcRequest::ScratchAppend { .. }
-            );
+            let mutated = mutates_store(&req);
             let mut store = store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let response = dispatch(req, &mut store);
+            let response = dispatch(req, &mut store, keys.as_deref());
             drop(store);
             if mutated {
                 notify.notify_waiters();
@@ -190,7 +196,26 @@ async fn read_bounded_utf8<R: tokio::io::AsyncRead + Unpin>(
 }
 
 #[cfg(any(unix, windows))]
-fn dispatch(req: IpcRequest, store: &mut MemoryStore) -> IpcResponse {
+fn mutates_store(req: &IpcRequest) -> bool {
+    matches!(
+        req,
+        IpcRequest::Put { .. }
+            | IpcRequest::PutFile { .. }
+            | IpcRequest::Pin { .. }
+            | IpcRequest::Rm { .. }
+            | IpcRequest::ScratchAppend { .. }
+            | IpcRequest::EnrollExport
+            | IpcRequest::EnrollApprove { .. }
+            | IpcRequest::EnrollImport { .. }
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn dispatch(
+    req: IpcRequest,
+    store: &mut MemoryStore,
+    keys: Option<&DeviceKeystore>,
+) -> IpcResponse {
     match req {
         IpcRequest::Put { bytes, kind, name } => {
             let result = if kind == ContentKind::File {
@@ -259,6 +284,125 @@ fn dispatch(req: IpcRequest, store: &mut MemoryStore) -> IpcResponse {
             Ok(text) => IpcResponse::Scratch { name, text },
             Err(err) => store_error(err),
         },
+        IpcRequest::EnrollExport => enroll_export(store, keys),
+        IpcRequest::EnrollApprove { join } => enroll_approve(store, keys, join),
+        IpcRequest::EnrollImport { grant, expect_sas } => {
+            enroll_import(store, keys, grant, expect_sas)
+        }
+        IpcRequest::RecoveryExport { passphrase } => recovery_export(store, keys, passphrase),
+        IpcRequest::RecoveryApply { .. } => IpcResponse::Error {
+            code: IpcErrorCode::Protocol,
+            message: "recovery apply is CLI-direct against an empty home".into(),
+        },
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn enroll_export(store: &mut MemoryStore, keys: Option<&DeviceKeystore>) -> IpcResponse {
+    let Some(keys) = keys else {
+        return enroll_needs_keystore();
+    };
+    match export_join_store(keys, store, Vec::new()) {
+        Ok((join, sas)) => match serde_json::to_value(&join) {
+            Ok(join) => IpcResponse::EnrollExport { join, sas },
+            Err(err) => IpcResponse::Error {
+                code: IpcErrorCode::Protocol,
+                message: err.to_string(),
+            },
+        },
+        Err(err) => keystore_error(err),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn enroll_approve(
+    store: &mut MemoryStore,
+    keys: Option<&DeviceKeystore>,
+    join: serde_json::Value,
+) -> IpcResponse {
+    let Some(keys) = keys else {
+        return enroll_needs_keystore();
+    };
+    let join: ShelfJoin = match serde_json::from_value(join) {
+        Ok(join) => join,
+        Err(err) => {
+            return IpcResponse::Error {
+                code: IpcErrorCode::Decode,
+                message: err.to_string(),
+            };
+        }
+    };
+    match approve_join_store(keys, store, &join) {
+        Ok((grant, sas)) => match serde_json::to_value(&grant) {
+            Ok(grant) => IpcResponse::EnrollApprove { grant, sas },
+            Err(err) => IpcResponse::Error {
+                code: IpcErrorCode::Protocol,
+                message: err.to_string(),
+            },
+        },
+        Err(err) => keystore_error(err),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn enroll_import(
+    store: &mut MemoryStore,
+    keys: Option<&DeviceKeystore>,
+    grant: serde_json::Value,
+    expect_sas: String,
+) -> IpcResponse {
+    let Some(keys) = keys else {
+        return enroll_needs_keystore();
+    };
+    let grant: ShelfGrant = match serde_json::from_value(grant) {
+        Ok(grant) => grant,
+        Err(err) => {
+            return IpcResponse::Error {
+                code: IpcErrorCode::Decode,
+                message: err.to_string(),
+            };
+        }
+    };
+    match import_grant_store(keys, store, &grant, &expect_sas) {
+        Ok(()) => IpcResponse::EnrollImport,
+        Err(err) => keystore_error(err),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn enroll_needs_keystore() -> IpcResponse {
+    IpcResponse::Error {
+        code: IpcErrorCode::Protocol,
+        message: "enroll requires an open vault".into(),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn recovery_export(
+    store: &mut MemoryStore,
+    keys: Option<&DeviceKeystore>,
+    passphrase: String,
+) -> IpcResponse {
+    let Some(keys) = keys else {
+        return enroll_needs_keystore();
+    };
+    match export_recovery_store(keys, store, &passphrase) {
+        Ok(bundle) => match serde_json::to_value(&bundle) {
+            Ok(bundle) => IpcResponse::RecoveryExport { bundle },
+            Err(err) => IpcResponse::Error {
+                code: IpcErrorCode::Protocol,
+                message: err.to_string(),
+            },
+        },
+        Err(err) => keystore_error(err),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn keystore_error(err: KeystoreError) -> IpcResponse {
+    IpcResponse::Error {
+        code: IpcErrorCode::Protocol,
+        message: err.to_string(),
     }
 }
 
@@ -305,14 +449,20 @@ async fn serve_windows(
     pipe_path: &Path,
     store: MemoryStore,
     home: Option<std::path::PathBuf>,
-    signer: Option<DeviceSigner>,
+    keys: Option<DeviceKeystore>,
 ) -> Result<(), DaemonError> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let store = Arc::new(Mutex::new(store));
     let notify = Arc::new(Notify::new());
-    if let (Some(home), Some(signer)) = (home, signer) {
-        crate::replica::spawn_replica(Arc::clone(&store), home, Arc::clone(&notify), signer);
+    let keys = keys.map(Arc::new);
+    if let (Some(home), Some(keys)) = (home, keys.as_ref()) {
+        crate::replica::spawn_replica(
+            Arc::clone(&store),
+            home,
+            Arc::clone(&notify),
+            keys.device_signer(),
+        );
     }
 
     let mut server = ServerOptions::new()
@@ -324,8 +474,9 @@ async fn serve_windows(
         server = ServerOptions::new().create(pipe_path)?;
         let store = Arc::clone(&store);
         let notify = Arc::clone(&notify);
+        let keys = keys.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_windows_pipe(connected, store, notify).await {
+            if let Err(err) = handle_windows_pipe(connected, store, notify, keys).await {
                 tracing::warn!(error = %err, "ipc connection failed");
             }
         });
@@ -337,6 +488,7 @@ async fn handle_windows_pipe(
     mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
     store: Arc<Mutex<MemoryStore>>,
     notify: Arc<Notify>,
+    keys: Option<Arc<DeviceKeystore>>,
 ) -> Result<(), DaemonError> {
     let Some(line) = read_bounded_utf8(&mut stream).await? else {
         return Ok(());
@@ -346,18 +498,11 @@ async fn handle_windows_pipe(
     }
     let response = match serde_json::from_str::<IpcRequest>(line.trim_end()) {
         Ok(req) => {
-            let mutated = matches!(
-                req,
-                IpcRequest::Put { .. }
-                    | IpcRequest::PutFile { .. }
-                    | IpcRequest::Pin { .. }
-                    | IpcRequest::Rm { .. }
-                    | IpcRequest::ScratchAppend { .. }
-            );
+            let mutated = mutates_store(&req);
             let mut store = store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let response = dispatch(req, &mut store);
+            let response = dispatch(req, &mut store, keys.as_deref());
             drop(store);
             if mutated {
                 notify.notify_waiters();

@@ -23,14 +23,14 @@ pub use blob::{ChunkId, DEFAULT_CHUNK_SIZE, FileManifest};
 pub use crdt::{CrdtError, ScratchId, ScratchPad, scratch_id_for};
 pub use crypto::{
     AeadAlgorithm, DOMAIN_CHUNK, DOMAIN_ENROLLMENT, DOMAIN_MEMBERSHIP, DOMAIN_METADATA,
-    DOMAIN_OBJECT, DOMAIN_SEARCH, Dek, EpochId, HybridKemProfile, PREFERRED_AEAD, PreferredAead,
-    PreferredMlKem, all_domain_labels,
+    DOMAIN_OBJECT, DOMAIN_RECOVERY, DOMAIN_SEARCH, Dek, EpochId, HybridKemProfile, PREFERRED_AEAD,
+    PreferredAead, PreferredMlKem, all_domain_labels,
 };
 pub use enrollment::{
     DeviceCapabilities, ENROLLMENT_PROTOCOL_VERSION, EncryptedMembershipState,
     EncryptedVaultKeyEnvelope, EnrollmentError, EnrollmentEvent, EnrollmentRequest,
     EnrollmentState, MailboxBinding, MemberRole, MembershipCertificate, MembershipGrant,
-    MembershipSnapshot, SignatureBytes, TransportHint, VaultRoot,
+    MembershipSnapshot, RoutingBinding, SignatureBytes, TransportHint, VaultRoot,
 };
 pub use identity::{
     DeviceId, DevicePublicIdentity, HybridKemPublicKey, IdentityError, ML_KEM_768_PUBLIC_KEY_LEN,

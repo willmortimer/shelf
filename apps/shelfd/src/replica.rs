@@ -1,5 +1,6 @@
 //! Replica fan-out: signed frames over Tailscale TCP, LAN, and mailbox.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -8,18 +9,29 @@ use std::time::Duration;
 use crate::store::MemoryStore;
 #[cfg(test)]
 use shelf_core::VaultId;
-use shelf_core::{DeviceId, ObjectId, SigningPublicKey, Timestamp};
+use shelf_core::{DeviceId, ObjectId, SigningPublicKey, Timestamp, TransportHint};
 use shelf_keystore::{DeviceSigner, verify_signature};
 use shelf_protocol::EncryptedObject;
 use shelf_store::SqliteStore;
 use shelf_transport::{
-    LanTransport, MailboxClient, OpBody, OriginCursor, PeerMessage, ReplicaFrame, SessionHello,
-    SignedOperation, accept_tls, connect_tls, hello_transcript, new_op_id, parse_home_config,
-    parse_sig_hex, read_bounded_line, sig_hex, tailscale_status, tls_exporter_client,
-    tls_exporter_server, write_bounded_line,
+    LanTransport, MailboxClient, OpBody, OriginCursor, PeerClientTls, PeerFrame, PeerMessage,
+    ReplicaFrame, SessionHello, SignedOperation, accept_tls_v2, connect_tls_v2, dial_addrs,
+    hello_transcript, new_op_id, parse_home_config, parse_sig_hex, read_peer_frame, sig_hex,
+    tailscale_status, tls_exporter_client, tls_exporter_server, write_peer_frame,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+
+/// How long a pooled peer wait (Have reply or handshake frame) may block.
+const PEER_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outbound rustls sessions keyed by the T1 dial set (`SocketAddr`).
+#[derive(Default)]
+struct OutboundPool {
+    sessions: HashMap<SocketAddr, PeerClientTls>,
+    #[cfg(test)]
+    connect_count: u32,
+}
 
 /// Background replica task. Safe to ignore if transports are absent.
 pub fn spawn_replica(
@@ -70,6 +82,7 @@ async fn replica_loop(
         });
     }
 
+    let mut pool = OutboundPool::default();
     loop {
         tokio::select! {
             _ = notify.notified() => {}
@@ -82,6 +95,7 @@ async fn replica_loop(
             &mailbox_id,
             lan.as_ref(),
             cfg.peer_port,
+            &mut pool,
         )
         .await;
         if let Some(client) = &mailbox
@@ -166,87 +180,91 @@ async fn accept_peer_sessions(
         let store = Arc::clone(&store);
         let signer = signer.clone();
         tokio::spawn(async move {
-            let Ok(mut tls) = accept_tls(stream).await else {
-                return;
-            };
-            let Ok(exporter) = tls_exporter_server(&tls) else {
-                return;
-            };
-            let Ok(Some(hello_bytes)) = read_bounded_line(&mut tls).await else {
-                return;
-            };
-            let Ok(hello) = serde_json::from_slice::<SessionHello>(
-                hello_bytes.strip_suffix(b"\n").unwrap_or(&hello_bytes),
-            ) else {
-                return;
-            };
-            let reply_line = {
-                let store = store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !hello_trusted(&store, &hello, &exporter) {
+            serve_peer_connection(stream, store, signer).await;
+        });
+    }
+}
+
+/// Inbound `shelf/2` session: Hello, then Have/Op until EOF. Bare SignedOperation JSON is not a frame.
+async fn serve_peer_connection(
+    stream: TcpStream,
+    store: Arc<Mutex<SqliteStore>>,
+    signer: DeviceSigner,
+) {
+    let Ok(mut tls) = accept_tls_v2(stream).await else {
+        return;
+    };
+    let Ok(exporter) = tls_exporter_server(&tls) else {
+        return;
+    };
+    let Ok(Some(PeerFrame::Hello(hello))) = read_peer_frame(&mut tls).await else {
+        return;
+    };
+    let reply = {
+        let store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !hello_trusted(&store, &hello, &exporter) {
+            return;
+        }
+        local_hello(&store, &signer, &exporter)
+    };
+    if write_peer_frame(&mut tls, &PeerFrame::Hello(reply))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(Some(frame)) = read_peer_frame(&mut tls).await {
+        match frame {
+            PeerFrame::Hello(_) => return,
+            PeerFrame::Message(PeerMessage::Have { cursors }) => {
+                let (have, missing) = {
+                    let store = store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let ours = store
+                        .op_cursors()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(origin, seq)| OriginCursor { origin, seq })
+                        .collect::<Vec<_>>();
+                    let want: Vec<(DeviceId, u64)> =
+                        cursors.iter().map(|c| (c.origin, c.seq)).collect();
+                    let missing = store.export_ops_after(&want).unwrap_or_default();
+                    (ours, missing)
+                };
+                if write_peer_frame(
+                    &mut tls,
+                    &PeerFrame::Message(PeerMessage::Have { cursors: have }),
+                )
+                .await
+                .is_err()
+                {
                     return;
                 }
-                let reply = local_hello(&store, &signer, &exporter);
-                serde_json::to_vec(&reply).ok()
-            };
-            let Some(line) = reply_line else {
-                return;
-            };
-            if write_bounded_line(&mut tls, &line).await.is_err() {
-                return;
-            }
-            while let Ok(Some(buf)) = read_bounded_line(&mut tls).await {
-                let slice = buf.strip_suffix(b"\n").unwrap_or(&buf);
-                if let Ok(PeerMessage::Have { cursors }) =
-                    serde_json::from_slice::<PeerMessage>(slice)
-                {
-                    let (have, missing) = {
-                        let store = store
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let ours = store
-                            .op_cursors()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|(origin, seq)| OriginCursor { origin, seq })
-                            .collect::<Vec<_>>();
-                        let want: Vec<(DeviceId, u64)> =
-                            cursors.iter().map(|c| (c.origin, c.seq)).collect();
-                        let missing = store.export_ops_after(&want).unwrap_or_default();
-                        (ours, missing)
-                    };
-                    let have_line = serde_json::to_vec(&PeerMessage::Have { cursors: have }).ok();
-                    if let Some(line) = have_line {
-                        let _ = write_bounded_line(&mut tls, &line).await;
+                for json in missing {
+                    if let Ok(op) = serde_json::from_str::<SignedOperation>(&json)
+                        && write_peer_frame(
+                            &mut tls,
+                            &PeerFrame::Message(PeerMessage::Op { op: Box::new(op) }),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
-                    for json in missing {
-                        if let Ok(op) = serde_json::from_str::<SignedOperation>(&json)
-                            && let Ok(line) =
-                                serde_json::to_vec(&PeerMessage::Op { op: Box::new(op) })
-                        {
-                            let _ = write_bounded_line(&mut tls, &line).await;
-                        }
-                    }
-                    continue;
                 }
-                let frame = if let Ok(PeerMessage::Op { op }) =
-                    serde_json::from_slice::<PeerMessage>(slice)
-                {
-                    *op
-                } else if let Ok(frame) = serde_json::from_slice::<ReplicaFrame>(slice) {
-                    frame
-                } else {
-                    continue;
-                };
+            }
+            PeerFrame::Message(PeerMessage::Op { op }) => {
                 let replies = {
                     let mut store = store
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    apply_frame(&mut store, Some(&signer), frame)
+                    apply_frame(&mut store, Some(&signer), *op)
                 };
                 for (parent, envelope) in replies {
-                    let line = {
+                    let frame = {
                         let store = store
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -254,17 +272,22 @@ async fn accept_peer_sessions(
                         let mut frame =
                             mint_op(&store, &signer, seq, OpBody::Chunk { parent, envelope });
                         sign_frame(&mut frame, &signer);
-                        serde_json::to_vec(&PeerMessage::Op {
-                            op: Box::new(frame),
-                        })
-                        .ok()
+                        frame
                     };
-                    if let Some(line) = line {
-                        let _ = write_bounded_line(&mut tls, &line).await;
+                    if write_peer_frame(
+                        &mut tls,
+                        &PeerFrame::Message(PeerMessage::Op {
+                            op: Box::new(frame),
+                        }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
                     }
                 }
             }
-        });
+        }
     }
 }
 
@@ -298,8 +321,9 @@ async fn push_now(
     _mailbox_id: &str,
     lan: Option<&LanTransport>,
     peer_port: u16,
+    pool: &mut OutboundPool,
 ) -> Result<(), std::io::Error> {
-    let (need_frames, our_cursors, bindings) = {
+    let (need_frames, our_cursors, bindings, member_hints) = {
         let store = store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -336,7 +360,8 @@ async fn push_now(
             .flatten()
             .map(|s| s.mailbox_bindings)
             .unwrap_or_default();
-        (need_frames, our_cursors, bindings)
+        let member_hints = validated_member_hints(&store);
+        (need_frames, our_cursors, bindings, member_hints)
     };
 
     if let Some(lan) = lan {
@@ -393,9 +418,10 @@ async fn push_now(
         }
     }
 
-    let addrs = tailscale_peer_addrs(peer_port);
+    let addrs = tailscale_peer_addrs(&member_hints, peer_port);
+    pool.sessions.retain(|addr, _| addrs.contains(addr));
     for addr in addrs {
-        let _ = send_session_batch(addr, signer, store, &our_cursors, &need_frames).await;
+        let _ = sync_peer(pool, addr, signer, store, &our_cursors, &need_frames).await;
     }
     Ok(())
 }
@@ -496,20 +522,57 @@ fn mint_op(store: &SqliteStore, signer: &DeviceSigner, seq: u64, body: OpBody) -
     }
 }
 
-async fn send_session_batch(
+async fn sync_peer(
+    pool: &mut OutboundPool,
     addr: SocketAddr,
     signer: &DeviceSigner,
     store: &Arc<Mutex<SqliteStore>>,
     our_cursors: &[OriginCursor],
     need_frames: &[SignedOperation],
 ) -> Result<(), std::io::Error> {
-    let connect = tokio::net::TcpStream::connect(addr);
+    if !pool.sessions.contains_key(&addr) {
+        let tls = open_outbound_session(addr, signer, store).await?;
+        note_connect(pool);
+        pool.sessions.insert(addr, tls);
+    }
+    {
+        let Some(reused) = pool.sessions.get_mut(&addr) else {
+            return Err(std::io::Error::other("missing pooled session"));
+        };
+        if exchange_have(reused, signer, store, our_cursors, need_frames)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    pool.sessions.remove(&addr);
+    let mut tls = open_outbound_session(addr, signer, store).await?;
+    note_connect(pool);
+    exchange_have(&mut tls, signer, store, our_cursors, need_frames).await?;
+    pool.sessions.insert(addr, tls);
+    Ok(())
+}
+
+fn note_connect(#[cfg_attr(not(test), allow(unused_variables))] pool: &mut OutboundPool) {
+    #[cfg(test)]
+    {
+        pool.connect_count = pool.connect_count.saturating_add(1);
+    }
+}
+
+async fn open_outbound_session(
+    addr: SocketAddr,
+    signer: &DeviceSigner,
+    store: &Arc<Mutex<SqliteStore>>,
+) -> Result<PeerClientTls, std::io::Error> {
+    let connect = TcpStream::connect(addr);
     let stream = tokio::time::timeout(Duration::from_secs(2), connect)
         .await
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "peer connect timed out")
         })??;
-    let mut tls = connect_tls(stream).await?;
+    let mut tls = connect_tls_v2(stream).await?;
     let exporter = tls_exporter_client(&tls)?;
     let hello = {
         let store = store
@@ -517,14 +580,16 @@ async fn send_session_batch(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         local_hello(&store, signer, &exporter)
     };
-    let hello_line = serde_json::to_vec(&hello).map_err(std::io::Error::other)?;
-    write_bounded_line(&mut tls, &hello_line).await?;
-    let Some(peer_bytes) = read_bounded_line(&mut tls).await? else {
-        return Err(std::io::Error::other("peer dropped during handshake"));
+    write_peer_frame(&mut tls, &PeerFrame::Hello(hello)).await?;
+    let peer = match read_frame_timed(&mut tls).await? {
+        Some(PeerFrame::Hello(hello)) => hello,
+        Some(_) => {
+            return Err(std::io::Error::other(
+                "peer sent non-hello during handshake",
+            ));
+        }
+        None => return Err(std::io::Error::other("peer dropped during handshake")),
     };
-    let peer: SessionHello =
-        serde_json::from_slice(peer_bytes.strip_suffix(b"\n").unwrap_or(&peer_bytes))
-            .map_err(std::io::Error::other)?;
     {
         let store = store
             .lock()
@@ -533,31 +598,41 @@ async fn send_session_batch(
             return Err(std::io::Error::other("peer handshake rejected"));
         }
     }
-    let have = PeerMessage::Have {
-        cursors: our_cursors.to_vec(),
-    };
-    let have_line = serde_json::to_vec(&have).map_err(std::io::Error::other)?;
-    write_bounded_line(&mut tls, &have_line).await?;
-    let Some(peer_have_bytes) = read_bounded_line(&mut tls).await? else {
-        return Ok(());
-    };
-    let peer_have: PeerMessage = serde_json::from_slice(
-        peer_have_bytes
-            .strip_suffix(b"\n")
-            .unwrap_or(&peer_have_bytes),
+    Ok(tls)
+}
+
+async fn exchange_have(
+    tls: &mut PeerClientTls,
+    signer: &DeviceSigner,
+    store: &Arc<Mutex<SqliteStore>>,
+    our_cursors: &[OriginCursor],
+    need_frames: &[SignedOperation],
+) -> Result<(), std::io::Error> {
+    write_peer_frame(
+        tls,
+        &PeerFrame::Message(PeerMessage::Have {
+            cursors: our_cursors.to_vec(),
+        }),
     )
-    .map_err(std::io::Error::other)?;
-    let peer_cursors = match peer_have {
-        PeerMessage::Have { cursors } => cursors
-            .into_iter()
-            .map(|c| (c.origin, c.seq))
-            .collect::<Vec<_>>(),
-        PeerMessage::Op { op } => {
-            let mut store = store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = apply_frame(&mut store, Some(signer), *op);
-            Vec::new()
+    .await?;
+    let peer_cursors = loop {
+        match read_frame_timed(tls).await? {
+            Some(PeerFrame::Hello(_)) => {
+                return Err(std::io::Error::other("unexpected hello after handshake"));
+            }
+            Some(PeerFrame::Message(PeerMessage::Have { cursors })) => {
+                break cursors
+                    .into_iter()
+                    .map(|c| (c.origin, c.seq))
+                    .collect::<Vec<_>>();
+            }
+            Some(PeerFrame::Message(PeerMessage::Op { op })) => {
+                let mut store = store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = apply_frame(&mut store, Some(signer), *op);
+            }
+            None => return Err(std::io::Error::other("peer closed during have")),
         }
     };
     let missing = {
@@ -568,34 +643,59 @@ async fn send_session_batch(
     };
     for json in missing {
         if let Ok(op) = serde_json::from_str::<SignedOperation>(&json) {
-            let line = serde_json::to_vec(&PeerMessage::Op { op: Box::new(op) })
-                .map_err(std::io::Error::other)?;
-            write_bounded_line(&mut tls, &line).await?;
+            write_peer_frame(
+                tls,
+                &PeerFrame::Message(PeerMessage::Op { op: Box::new(op) }),
+            )
+            .await?;
         }
     }
     for frame in need_frames {
-        let line = serde_json::to_vec(&PeerMessage::Op {
-            op: Box::new(frame.clone()),
-        })
-        .map_err(std::io::Error::other)?;
-        write_bounded_line(&mut tls, &line).await?;
+        write_peer_frame(
+            tls,
+            &PeerFrame::Message(PeerMessage::Op {
+                op: Box::new(frame.clone()),
+            }),
+        )
+        .await?;
     }
     Ok(())
 }
 
-fn tailscale_peer_addrs(peer_port: u16) -> Vec<SocketAddr> {
+async fn read_frame_timed(tls: &mut PeerClientTls) -> Result<Option<PeerFrame>, std::io::Error> {
+    tokio::time::timeout(PEER_IO_TIMEOUT, read_peer_frame(tls))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "peer i/o timed out"))?
+}
+
+fn validated_member_hints(store: &SqliteStore) -> Vec<TransportHint> {
+    let Ok(members) = store.validated_members() else {
+        return Vec::new();
+    };
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let local = store.device_id();
+    let ids: std::collections::BTreeSet<_> = members
+        .into_iter()
+        .map(|c| c.device_id)
+        .filter(|id| *id != local)
+        .collect();
+    let Ok(Some(snap)) = store.membership_snapshot() else {
+        return Vec::new();
+    };
+    snap.routing_hints
+        .into_iter()
+        .filter(|b| ids.contains(&b.device_id))
+        .flat_map(|b| b.hints)
+        .collect()
+}
+
+fn tailscale_peer_addrs(member_hints: &[TransportHint], peer_port: u16) -> Vec<SocketAddr> {
     let Ok(status) = tailscale_status() else {
         return Vec::new();
     };
-    let mut addrs = Vec::new();
-    for peer in status.peers.into_iter().filter(|p| p.online) {
-        for ip in peer.ips {
-            if let Ok(addr) = format!("{ip}:{peer_port}").parse() {
-                addrs.push(addr);
-            }
-        }
-    }
-    addrs
+    dial_addrs(&status, member_hints, peer_port)
 }
 
 fn sign_frame(frame: &mut ReplicaFrame, signer: &DeviceSigner) {
@@ -855,6 +955,24 @@ mod tests {
             request_hash: [0; 32],
             issuer_signature: shelf_core::SignatureBytes::from_bytes([0; 64]),
         }
+    }
+
+    #[test]
+    fn validated_member_hints_empty_without_signed_snapshot() {
+        use shelf_protocol::EpochKey;
+        let dir = tempfile::tempdir().unwrap();
+        let ka = DeviceKeystore::open_or_init(dir.path(), Some("a"), None, true).unwrap();
+        let sa = ka.device_signer();
+        let store = SqliteStore::open(
+            &dir.path().join("state.db"),
+            EpochKey::from_bytes(*EpochKey::new().as_bytes()),
+            sa.device_id(),
+            EpochId::new(1),
+            VaultId::new(),
+            &[0xEE; 32],
+        )
+        .unwrap();
+        assert!(validated_member_hints(&store).is_empty());
     }
 
     #[test]
@@ -1287,5 +1405,254 @@ mod tests {
         sign_frame(&mut pin, &sa);
         apply_frame(&mut b, Some(&sb), pin);
         assert!(!b.ls().unwrap()[0].pinned);
+    }
+
+    struct TwoStores {
+        _dir_a: tempfile::TempDir,
+        _dir_b: tempfile::TempDir,
+        sa: DeviceSigner,
+        sb: DeviceSigner,
+        a: Arc<Mutex<SqliteStore>>,
+        b: Arc<Mutex<SqliteStore>>,
+    }
+
+    fn two_member_stores() -> TwoStores {
+        use shelf_protocol::EpochKey;
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let ka = DeviceKeystore::open_or_init(dir_a.path(), Some("a"), None, true).unwrap();
+        let kb = DeviceKeystore::open_or_init(dir_b.path(), Some("b"), None, true).unwrap();
+        let sa = ka.device_signer();
+        let sb = kb.device_signer();
+        let key_bytes = *EpochKey::new().as_bytes();
+        let vault = VaultId::new();
+        let epoch = EpochId::new(1);
+        let a = SqliteStore::open(
+            &dir_a.path().join("state.db"),
+            EpochKey::from_bytes(key_bytes),
+            sa.device_id(),
+            epoch,
+            vault,
+            &[0xEE; 32],
+        )
+        .unwrap();
+        let b = SqliteStore::open(
+            &dir_b.path().join("state.db"),
+            EpochKey::from_bytes(key_bytes),
+            sb.device_id(),
+            epoch,
+            vault,
+            &[0xEE; 32],
+        )
+        .unwrap();
+        a.put_member(&member_cert(vault, &sa, 1)).unwrap();
+        a.put_member(&member_cert(vault, &sb, 2)).unwrap();
+        b.put_member(&member_cert(vault, &sa, 1)).unwrap();
+        b.put_member(&member_cert(vault, &sb, 2)).unwrap();
+        TwoStores {
+            _dir_a: dir_a,
+            _dir_b: dir_b,
+            sa,
+            sb,
+            a: Arc::new(Mutex::new(a)),
+            b: Arc::new(Mutex::new(b)),
+        }
+    }
+
+    fn put_logged(
+        store: &Arc<Mutex<SqliteStore>>,
+        signer: &DeviceSigner,
+        bytes: &[u8],
+    ) -> (ObjectId, Vec<OriginCursor>) {
+        let mut store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (id, _) = store.put(bytes.to_vec(), ContentKind::Text, None).unwrap();
+        ensure_op_log(&store, signer);
+        let cursors = store
+            .op_cursors()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(origin, seq)| OriginCursor { origin, seq })
+            .collect();
+        (id, cursors)
+    }
+
+    async fn wait_bytes(store: &Arc<Mutex<SqliteStore>>, id: ObjectId, expected: &[u8]) {
+        for _ in 0..100 {
+            {
+                let store = store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Ok(got) = store.get(&ItemTarget::Id(id))
+                    && got.bytes == expected
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for replicated object");
+    }
+
+    #[tokio::test]
+    async fn two_have_batches_reuse_one_tls_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pair = two_member_stores();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let store_in = Arc::clone(&pair.b);
+        let signer_in = pair.sb.clone();
+        let connects_in = Arc::clone(&connects);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                connects_in.fetch_add(1, Ordering::SeqCst);
+                let store = Arc::clone(&store_in);
+                let signer = signer_in.clone();
+                tokio::spawn(async move {
+                    serve_peer_connection(stream, store, signer).await;
+                });
+            }
+        });
+
+        let mut pool = OutboundPool::default();
+        let (id1, cursors) = put_logged(&pair.a, &pair.sa, b"batch-one");
+        sync_peer(&mut pool, addr, &pair.sa, &pair.a, &cursors, &[])
+            .await
+            .unwrap();
+        wait_bytes(&pair.b, id1, b"batch-one").await;
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.connect_count, 1);
+
+        let (id2, cursors) = put_logged(&pair.a, &pair.sa, b"batch-two");
+        sync_peer(&mut pool, addr, &pair.sa, &pair.a, &cursors, &[])
+            .await
+            .unwrap();
+        wait_bytes(&pair.b, id2, b"batch-two").await;
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.connect_count, 1);
+        assert_eq!(pool.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn outbound_pool_reconnects_after_io_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pair = two_member_stores();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let store_in = Arc::clone(&pair.b);
+        let signer_in = pair.sb.clone();
+        let connects_in = Arc::clone(&connects);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                connects_in.fetch_add(1, Ordering::SeqCst);
+                let store = Arc::clone(&store_in);
+                let signer = signer_in.clone();
+                let drop_after_have = connects_in.load(Ordering::SeqCst) == 1;
+                tokio::spawn(async move {
+                    if drop_after_have {
+                        serve_one_have_then_drop(stream, store, signer).await;
+                    } else {
+                        serve_peer_connection(stream, store, signer).await;
+                    }
+                });
+            }
+        });
+
+        let mut pool = OutboundPool::default();
+        let (id1, cursors) = put_logged(&pair.a, &pair.sa, b"first");
+        sync_peer(&mut pool, addr, &pair.sa, &pair.a, &cursors, &[])
+            .await
+            .unwrap();
+        wait_bytes(&pair.b, id1, b"first").await;
+        assert_eq!(pool.connect_count, 1);
+
+        let (id2, cursors) = put_logged(&pair.a, &pair.sa, b"second");
+        sync_peer(&mut pool, addr, &pair.sa, &pair.a, &cursors, &[])
+            .await
+            .unwrap();
+        wait_bytes(&pair.b, id2, b"second").await;
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.connect_count, 2);
+    }
+
+    async fn serve_one_have_then_drop(
+        stream: tokio::net::TcpStream,
+        store: Arc<Mutex<SqliteStore>>,
+        signer: DeviceSigner,
+    ) {
+        let Ok(mut tls) = accept_tls_v2(stream).await else {
+            return;
+        };
+        let Ok(exporter) = tls_exporter_server(&tls) else {
+            return;
+        };
+        let Ok(Some(PeerFrame::Hello(hello))) = read_peer_frame(&mut tls).await else {
+            return;
+        };
+        let reply = {
+            let store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !hello_trusted(&store, &hello, &exporter) {
+                return;
+            }
+            local_hello(&store, &signer, &exporter)
+        };
+        if write_peer_frame(&mut tls, &PeerFrame::Hello(reply))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Ok(Some(PeerFrame::Message(PeerMessage::Have { cursors }))) =
+            read_peer_frame(&mut tls).await
+        {
+            let (have, missing) = {
+                let store = store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ours = store
+                    .op_cursors()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(origin, seq)| OriginCursor { origin, seq })
+                    .collect::<Vec<_>>();
+                let want: Vec<(DeviceId, u64)> =
+                    cursors.iter().map(|c| (c.origin, c.seq)).collect();
+                let missing = store.export_ops_after(&want).unwrap_or_default();
+                (ours, missing)
+            };
+            let _ = write_peer_frame(
+                &mut tls,
+                &PeerFrame::Message(PeerMessage::Have { cursors: have }),
+            )
+            .await;
+            for json in missing {
+                if let Ok(op) = serde_json::from_str::<SignedOperation>(&json) {
+                    let _ = write_peer_frame(
+                        &mut tls,
+                        &PeerFrame::Message(PeerMessage::Op { op: Box::new(op) }),
+                    )
+                    .await;
+                }
+            }
+            if let Ok(Some(PeerFrame::Message(PeerMessage::Op { op }))) =
+                read_peer_frame(&mut tls).await
+            {
+                let mut store = store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = apply_frame(&mut store, Some(&signer), *op);
+            }
+        }
     }
 }

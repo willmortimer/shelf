@@ -27,5 +27,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
 ] }
 
+# iOS-only: ~thin Security.framework wrapper (MIT OR Apache-2.0). Not linked on
+# linux/macOS/Windows CI. Remove this target-dep and the ios cfg blocks in
+# platform.rs to drop Keychain wrap (passphrase remains).
+[target.'cfg(target_os = "ios")'.dependencies]
+security-framework = "3.7.0"
+
 [dev-dependencies]
 tempfile = "3.23.0"

@@ -6,11 +6,14 @@
 
 mod enroll;
 mod platform;
+mod recovery;
 mod vault;
 
 pub use enroll::{
-    ShelfGrant, ShelfJoin, approve_join, ensure_local_root, export_join, grant_sas, import_grant,
+    ShelfGrant, ShelfJoin, approve_join, approve_join_store, ensure_local_root, export_join,
+    export_join_store, grant_sas, import_grant, import_grant_store,
 };
+pub use recovery::{RecoveryBundle, apply_recovery, export_recovery, export_recovery_store};
 pub use vault::{Vault, ensure_home_layout, open_or_create_vault, revoke_device};
 
 use std::fs;
@@ -53,6 +56,12 @@ pub enum KeystoreError {
     /// Enrollment request or grant signature was invalid or expired.
     #[error("enrollment signature: {0}")]
     Signature(String),
+    /// Recovery bundle could not be opened (wrong passphrase or corrupt file).
+    #[error("recovery bundle: wrong passphrase or corrupt file")]
+    Recovery,
+    /// `recovery apply` was pointed at a home that already has an identity.
+    #[error("recovery apply requires an empty home (no identity.json)")]
+    RecoveryHomeNotEmpty,
 }
 
 /// How the local wrap key is held.
@@ -299,6 +308,54 @@ impl DeviceKeystore {
     pub fn home(&self) -> &Path {
         &self.home
     }
+
+    pub(crate) fn secret_blob(&self) -> SecretBlob {
+        SecretBlob {
+            signing: self.signing.to_bytes(),
+            x25519: self.x25519.to_bytes(),
+            ml_kem_dk: self.ml_kem_dk.clone(),
+        }
+    }
+
+    /// Install recovered identity secrets into an empty home.
+    pub(crate) fn install(
+        home: &Path,
+        stored: DevicePublicIdentity,
+        secrets: &SecretBlob,
+        wrap_passphrase: Option<&str>,
+        allow_file_key: bool,
+    ) -> Result<Self, KeystoreError> {
+        crate::vault::ensure_home_layout(home)?;
+        if home.join("identity.json").exists() {
+            return Err(KeystoreError::RecoveryHomeNotEmpty);
+        }
+        let signing = SigningKey::from_bytes(&secrets.signing);
+        let x25519 = x25519_dalek::StaticSecret::from(secrets.x25519);
+        let identity = identity_from_secrets(&stored, &signing, &x25519, &secrets.ml_kem_dk)?;
+        if identity.device_id != stored.device_id {
+            return Err(KeystoreError::Identity(
+                "recovered identity device id mismatch".into(),
+            ));
+        }
+        let (wrap_key, custody) = create_wrap_key(home, wrap_passphrase, allow_file_key)?;
+        let wrapped = wrap_secrets(&wrap_key, secrets)?;
+        let file = IdentityFile {
+            version: 1,
+            identity: identity.clone(),
+            wrapped_secrets: wrapped,
+        };
+        let mut f = create_private_file(&home.join("identity.json"))?;
+        f.write_all(serde_json::to_string_pretty(&file)?.as_bytes())?;
+        Ok(Self {
+            home: home.to_path_buf(),
+            identity,
+            signing,
+            x25519,
+            ml_kem_dk: secrets.ml_kem_dk.clone(),
+            wrap_key,
+            custody,
+        })
+    }
 }
 
 impl Drop for DeviceKeystore {
@@ -435,7 +492,11 @@ fn unwrap_secrets(wrap_key: &[u8; 32], blob: &[u8]) -> Result<SecretBlob, Keysto
     Ok(serde_json::from_slice(&json)?)
 }
 
-fn aead_wrap(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+pub(crate) fn aead_wrap(
+    key: &[u8; 32],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, KeystoreError> {
     let nonce: [u8; 24] = rand::random();
     let cipher = XChaCha20Poly1305::new(&Key::from(*key));
     let ct = cipher
@@ -453,7 +514,7 @@ fn aead_wrap(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Ke
     Ok(out)
 }
 
-fn aead_open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+pub(crate) fn aead_open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>, KeystoreError> {
     if blob.len() < 24 {
         return Err(KeystoreError::Wrap);
     }
@@ -627,6 +688,25 @@ mod tests {
         match DeviceKeystore::open_or_init(dir.path(), Some("x"), None, false) {
             Ok(ks) => assert_eq!(ks.custody(), Custody::Platform),
             Err(KeystoreError::NoCustody) => {}
+            Err(other) => panic!("unexpected {other}"),
+        }
+    }
+
+    /// iOS must never persist `wrap.key`, even if the caller passes
+    /// `allow_file_key`. Compiled only for `target_os = "ios"`.
+    #[cfg(target_os = "ios")]
+    #[test]
+    fn ios_never_writes_file_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrap_path = dir.path().join("wrap.key");
+        match DeviceKeystore::open_or_init(dir.path(), Some("ios"), None, true) {
+            Ok(ks) => {
+                assert_eq!(ks.custody(), Custody::Platform);
+                assert!(!wrap_path.exists(), "iOS must not write wrap.key");
+            }
+            Err(KeystoreError::NoCustody) => {
+                assert!(!wrap_path.exists(), "iOS must not write wrap.key");
+            }
             Err(other) => panic!("unexpected {other}"),
         }
     }

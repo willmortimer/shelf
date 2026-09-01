@@ -43,6 +43,7 @@ pub fn ensure_home_layout(home: &Path) -> Result<(), KeystoreError> {
             "# Shelf local preferences. Do not put secrets here.\n\
              # mailbox_url = \"127.0.0.1:8743\"\n\
              # lan_port = 18732\n\
+             # lan_address = \"192.0.2.10:18732\"\n\
              # peer_port = 18733\n",
         )?;
     }
@@ -183,7 +184,15 @@ pub fn revoke_device(
         .map_err(|e| KeystoreError::Identity(e.to_string()))?
         .map(|s| s.generation.saturating_add(1))
         .unwrap_or(1);
-    let snapshot = sign_snapshot(vault, &root, remaining, generation, None, Some(device_id))?;
+    let snapshot = sign_snapshot(
+        &vault.keys,
+        &vault.store,
+        &root,
+        remaining,
+        generation,
+        None,
+        Some(device_id),
+    )?;
     vault
         .store
         .save_membership_snapshot(&snapshot)

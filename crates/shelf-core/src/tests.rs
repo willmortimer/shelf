@@ -114,10 +114,11 @@ fn domain_labels_unique_and_specified() {
             "shelf/enrollment/v1",
             "shelf/membership/v1",
             "shelf/search/v1",
+            "shelf/recovery/v1",
         ]
     );
     let set: BTreeSet<_> = labels.into_iter().collect();
-    assert_eq!(set.len(), 6);
+    assert_eq!(set.len(), 7);
 }
 
 #[test]

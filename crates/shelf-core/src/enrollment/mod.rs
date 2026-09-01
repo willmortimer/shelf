@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::crypto::EpochId;
 use crate::identity::{DeviceId, HybridKemPublicKey, SigningPublicKey, VaultId, X25519PublicKey};
 use crate::model::Timestamp;
+use crate::transcript::Transcript;
 
 /// Current enrollment protocol version carried on requests.
 pub const ENROLLMENT_PROTOCOL_VERSION: u16 = 1;
@@ -129,20 +130,7 @@ impl EnrollmentRequest {
         t.push_fixed(self.ephemeral_pubkey.as_bytes());
         t.push_u16(u16::try_from(self.transport_hints.len()).unwrap_or(u16::MAX));
         for hint in &self.transport_hints {
-            match hint {
-                TransportHint::Lan { address } => {
-                    t.push_u8(1);
-                    t.push_bytes(address.as_bytes());
-                }
-                TransportHint::Tailscale { address } => {
-                    t.push_u8(2);
-                    t.push_bytes(address.as_bytes());
-                }
-                TransportHint::RendezvousToken { token } => {
-                    t.push_u8(3);
-                    t.push_bytes(token.as_bytes());
-                }
-            }
+            push_transport_hint(&mut t, hint);
         }
         t.push_u8(u8::from(self.capabilities.can_approve_enrollment));
         t.push_u8(u8::from(self.capabilities.can_issue_grants));
@@ -158,6 +146,31 @@ impl EnrollmentRequest {
         t.push_bytes(self.mailbox_id.as_bytes());
         t.push_bytes(self.mailbox_write_cap.as_bytes());
         t
+    }
+}
+
+fn push_transport_hint(t: &mut Transcript, hint: &TransportHint) {
+    match hint {
+        TransportHint::Lan { address } => {
+            t.push_u8(1);
+            t.push_bytes(address.as_bytes());
+        }
+        TransportHint::Tailscale { address } => {
+            t.push_u8(2);
+            t.push_bytes(address.as_bytes());
+        }
+        TransportHint::RendezvousToken { token } => {
+            t.push_u8(3);
+            t.push_bytes(token.as_bytes());
+        }
+    }
+}
+
+fn transport_hint_sort_key(hint: &TransportHint) -> (u8, &str) {
+    match hint {
+        TransportHint::Lan { address } => (1, address.as_str()),
+        TransportHint::Tailscale { address } => (2, address.as_str()),
+        TransportHint::RendezvousToken { token } => (3, token.as_str()),
     }
 }
 
@@ -233,6 +246,9 @@ pub struct MembershipSnapshot {
     /// Per-device mailbox receive address and write capability.
     #[serde(default)]
     pub mailbox_bindings: Vec<MailboxBinding>,
+    /// Per-device connectivity hints. Not a trust signal.
+    #[serde(default)]
+    pub routing_hints: Vec<RoutingBinding>,
     /// Root signature over [`Self::transcript`].
     pub snapshot_signature: SignatureBytes,
 }
@@ -246,6 +262,15 @@ pub struct MailboxBinding {
     pub mailbox_id: String,
     /// Capability required to PUT into this mailbox (hex).
     pub write_cap: String,
+}
+
+/// How a member asked to be reached. Hints are not membership.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingBinding {
+    /// Device these hints belong to.
+    pub device_id: DeviceId,
+    /// Advertised addresses (Tailscale, LAN, or rendezvous).
+    pub hints: Vec<TransportHint>,
 }
 
 impl MembershipSnapshot {
@@ -269,6 +294,18 @@ impl MembershipSnapshot {
             t.push_fixed(b.device_id.as_bytes());
             t.push_bytes(b.mailbox_id.as_bytes());
             t.push_bytes(b.write_cap.as_bytes());
+        }
+        t.push_u16(u16::try_from(self.routing_hints.len()).unwrap_or(u16::MAX));
+        let mut routes = self.routing_hints.clone();
+        routes.sort_by(|a, b| a.device_id.as_bytes().cmp(b.device_id.as_bytes()));
+        for r in &routes {
+            t.push_fixed(r.device_id.as_bytes());
+            let mut hints = r.hints.clone();
+            hints.sort_by(|a, b| transport_hint_sort_key(a).cmp(&transport_hint_sort_key(b)));
+            t.push_u16(u16::try_from(hints.len()).unwrap_or(u16::MAX));
+            for hint in &hints {
+                push_transport_hint(&mut t, hint);
+            }
         }
         t
     }
@@ -521,7 +558,9 @@ impl EnrollmentState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{DeviceId, ML_KEM_768_PUBLIC_KEY_LEN, MlKem768PublicKey};
+    use crate::identity::{
+        DeviceId, ML_KEM_768_PUBLIC_KEY_LEN, MlKem768PublicKey, SigningPublicKey,
+    };
 
     fn all_events() -> [EnrollmentEvent; 6] {
         [
@@ -626,5 +665,52 @@ mod tests {
         assert_eq!(env.as_bytes(), &[0xab, 0xcd]);
         let _ = DeviceId::new();
         let _ = MlKem768PublicKey::from_bytes(vec![0x11; ML_KEM_768_PUBLIC_KEY_LEN]).unwrap();
+    }
+
+    #[test]
+    fn snapshot_routing_hints_round_trip_and_verify() {
+        use crate::crypto::EpochId;
+        use crate::identity::VaultId;
+        use ed25519_dalek::Signer;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let vk = SigningPublicKey::from(signing.verifying_key());
+        let root = VaultRoot {
+            vault_id: VaultId::from_bytes([1; 32]),
+            root_signing_pubkey: vk,
+            generation: 1,
+        };
+        let mut snap = MembershipSnapshot {
+            vault_root: root.clone(),
+            generation: 1,
+            epoch: EpochId::new(1),
+            certificates: vec![],
+            mailbox_bindings: vec![],
+            routing_hints: vec![RoutingBinding {
+                device_id: DeviceId::from_bytes([2; 32]),
+                hints: vec![TransportHint::Tailscale {
+                    address: "100.64.0.1".into(),
+                }],
+            }],
+            snapshot_signature: SignatureBytes::from_bytes([0; 64]),
+        };
+        let sig = signing.sign(snap.transcript().as_bytes());
+        snap.snapshot_signature = SignatureBytes::from_bytes(sig.to_bytes());
+        assert!(snap.verify(&root));
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: MembershipSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+        assert!(back.verify(&root));
+
+        let mut stripped: serde_json::Value = serde_json::from_str(&json).unwrap();
+        stripped.as_object_mut().unwrap().remove("routing_hints");
+        let legacy: MembershipSnapshot = serde_json::from_value(stripped).unwrap();
+        assert!(legacy.routing_hints.is_empty());
+        assert!(!legacy.verify(&root));
+
+        let mut tampered = snap.clone();
+        tampered.routing_hints.clear();
+        assert!(!tampered.verify(&root));
     }
 }

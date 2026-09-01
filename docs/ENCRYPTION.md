@@ -39,9 +39,9 @@ The exact wire construction must be selected from a well-reviewed library/provid
 The 32-byte device wrap key protects identity secrets and the vault epoch key. Create order is fail-closed:
 
 1. `--passphrase` → Argon2id (salt in `wrap.salt`)
-2. Platform store: macOS Keychain (`security`), Linux Secret Service (`secret-tool`), Windows DPAPI (`wrap.dpapi`)
+2. Platform store: macOS Keychain (`security` CLI), iOS Keychain (`security-framework`), Linux Secret Service (`secret-tool`), Windows DPAPI (`wrap.dpapi`)
 3. `--allow-file-key` → `~/.shelf/wrap.key` created with mode 0600 (unsafe hatch)
-4. Otherwise init fails. iOS never uses file wrap.
+4. Otherwise init fails. iOS never uses file wrap (`allow_file_key` stays false; Keychain or a passphrase only).
 
 Existing vaults that already have `wrap.key` still load it. Headless installs work with a platform store or a passphrase; Kage is not required.
 
@@ -113,6 +113,7 @@ shelf/metadata/v1
 shelf/enrollment/v1
 shelf/membership/v1
 shelf/search/v1
+shelf/recovery/v1
 ```
 
 Do not reuse raw root material across different cryptographic purposes.
@@ -215,6 +216,8 @@ encrypted device secret material
 
 The file system may contain encrypted key blobs that are useless without the TPM/Secure Enclave/Kage-controlled wrapping key.
 
+On iOS, wrap-key custody is a Keychain generic password (`service` `shelf.wrap-key`, `account` derived from the app home the same way as macOS) via the `security-framework` crate (MIT/Apache-2.0, Apple-only target dependency). The item is hardware-encrypted with Secure Enclave–bound class keys when the device has a Secure Enclave. iOS still never writes `wrap.key`. macOS continues to use the `security` CLI, not `security-framework`.
+
 ## Headless fallback
 
 For systems without appropriate hardware-backed custody, Shelf may use a passphrase-protected software key store in `~/.shelf/`.
@@ -231,19 +234,31 @@ No unencrypted private key files.
 
 ## Recovery
 
-Recovery material should be a separate explicitly generated artifact, never an automatic plaintext backup of device private keys.
+Recovery material is a separate explicitly generated artifact, never an automatic plaintext backup of device private keys.
 
-Possible model:
+v1 bundle (`shelf/recovery/v1`, file extension `.shelfrecovery`):
 
 ```text
-RecoveryRoot
+RecoveryRoot (vault root identity secrets
+              + current epoch key
+              + membership snapshot
+              + sealed object envelopes)
    ↓
-wrap current vault bootstrap/recovery secret
+Argon2id (salt in the bundle) → wrap key
    ↓
-passphrase-encrypted recovery bundle
+XChaCha20-Poly1305, AAD = transcript(shelf/recovery/v1, version, vault_id)
 ```
 
-Recovery should be versioned and rotatable.
+CLI:
+
+```bash
+shelf recovery export --out vault.shelfrecovery
+shelf recovery apply --from vault.shelfrecovery
+```
+
+The bundle passphrase is a hidden TTY prompt when stdin is a TTY, otherwise `SHELF_RECOVERY_PASSPHRASE` (not argv). It is not the vault wrap-key passphrase. Apply targets an empty `--home` and is always CLI-direct so a running daemon of another vault cannot receive the bundle. Export uses local IPC when `shelfd` is up.
+
+Apply restores the existing `VaultRoot` (decrypt + v1 root-only grants). A mailbox cannot recover a vault. Recovery is versioned; Kage-managed recovery keys are out of scope for v1.
 
 ## Forward secrecy considerations
 
