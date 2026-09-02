@@ -10,15 +10,13 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use shelf_core::{Peer, PeerId, PeerTransport};
-use shelf_store::SealedRecord;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
 
 mod codec;
 mod frame;
+mod lan;
 mod session;
 
 pub use codec::{PeerFrame, read_peer_frame, write_peer_frame};
@@ -26,6 +24,7 @@ pub use frame::{
     OpBody, OriginCursor, PeerMessage, ReplicaFrame, SignedOperation, new_op_id, parse_sig_hex,
     sig_hex,
 };
+pub use lan::LanTransport;
 pub use session::{
     PEER_ALPN_V1, PEER_ALPN_V2, PeerClientTls, SessionHello, accept_tls, accept_tls_v2,
     connect_tls, connect_tls_v2, hello_transcript, read_bounded_line, tls_exporter_client,
@@ -289,7 +288,7 @@ fn parse_socket_addr(ip: &str, port: u16) -> Option<SocketAddr> {
     format!("[{ip}]:{port}").parse().ok()
 }
 
-fn peer_id_from_key(key: &[u8]) -> PeerId {
+pub(crate) fn peer_id_from_key(key: &[u8]) -> PeerId {
     PeerId::from_bytes(*blake3::hash(key).as_bytes())
 }
 
@@ -338,75 +337,6 @@ pub async fn send_replica_line(addr: SocketAddr, line: &[u8]) -> Result<(), Tran
     stream.write_all(b"\n").await?;
     stream.flush().await?;
     Ok(())
-}
-
-#[derive(Serialize, Deserialize)]
-struct LanPacket {
-    v: u16,
-    kind: String,
-    payload: serde_json::Value,
-}
-
-/// LAN UDP transport. Discovery does not confer membership.
-pub struct LanTransport {
-    socket: UdpSocket,
-    port: u16,
-}
-
-impl LanTransport {
-    /// Bind `0.0.0.0:port` (or ephemeral if `port` is 0).
-    pub async fn bind(port: u16) -> Result<Self, TransportError> {
-        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
-        socket.set_broadcast(true)?;
-        let port = socket.local_addr()?.port();
-        Ok(Self { socket, port })
-    }
-
-    /// Broadcast a presence packet (`_shelf._udp` analogue).
-    pub async fn announce(&self) -> Result<(), TransportError> {
-        let pkt = LanPacket {
-            v: 1,
-            kind: "announce".into(),
-            payload: serde_json::json!({ "port": self.port }),
-        };
-        let bytes = serde_json::to_vec(&pkt)?;
-        let _ = self
-            .socket
-            .send_to(&bytes, SocketAddr::from(([255, 255, 255, 255], self.port)))
-            .await;
-        Ok(())
-    }
-
-    /// Broadcast a sealed object record (ciphertext JSON).
-    pub async fn broadcast_object(&self, record: &SealedRecord) -> Result<(), TransportError> {
-        let pkt = LanPacket {
-            v: 1,
-            kind: "object".into(),
-            payload: serde_json::to_value(record)?,
-        };
-        let bytes = serde_json::to_vec(&pkt)?;
-        let _ = self
-            .socket
-            .send_to(&bytes, SocketAddr::from(([255, 255, 255, 255], self.port)))
-            .await;
-        Ok(())
-    }
-}
-
-impl PeerTransport for LanTransport {
-    type Connection = SocketAddr;
-    type Error = TransportError;
-
-    async fn discover(&self) -> Vec<Peer> {
-        let _ = self.announce().await;
-        Vec::new()
-    }
-
-    async fn connect(&self, _peer: PeerId) -> Result<Self::Connection, Self::Error> {
-        Err(TransportError::Io(std::io::Error::other(
-            "LAN connect requires an explicit address hint",
-        )))
-    }
 }
 
 #[cfg(test)]
