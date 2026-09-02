@@ -21,7 +21,7 @@ fn help_lists_core_commands() {
     );
     for cmd in [
         "put", "latest", "ls", "get", "pin", "rm", "init", "enroll", "scratch", "capture",
-        "recovery", "devices",
+        "recovery", "devices", "search",
     ] {
         assert!(
             text.contains(cmd),
@@ -193,6 +193,91 @@ mod ipc {
         let ls_text = String::from_utf8_lossy(&ls.stdout);
         assert!(ls_text.contains("pinned"), "ls after pin:\n{ls_text}");
         assert!(!ls_text.contains("hello"));
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_hits_unique_payload_and_misses_absent() {
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        let payload = format!("find-cli-{}-{}", std::process::id(), "payload");
+        assert_success(&run_with_stdin(&sock, &["put"], payload.as_bytes()));
+        let hit = run(&sock, &["search", &payload]);
+        assert_success(&hit);
+        let hit_text = String::from_utf8_lossy(&hit.stdout);
+        assert!(!hit_text.is_empty(), "search should print an ls-style line");
+        assert!(
+            !hit_text.contains(&payload),
+            "search listing must not include plaintext:\n{hit_text}"
+        );
+
+        let miss = run(&sock, &["search", "no-such-substring-zzzz"]);
+        assert_success(&miss);
+        assert!(miss.stdout.is_empty(), "missing query should print no hits");
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archive_hides_from_ls_until_archived_flag() {
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        let put = run_with_stdin(&sock, &["put"], b"archive-me");
+        assert_success(&put);
+        let id = String::from_utf8_lossy(&put.stdout).trim().to_string();
+        assert_success(&run(&sock, &["archive", "1"]));
+
+        let ls = run(&sock, &["ls"]);
+        assert_success(&ls);
+        let ls_text = String::from_utf8_lossy(&ls.stdout);
+        assert!(
+            !ls_text.contains(&id),
+            "archived item leaked into ls:\n{ls_text}"
+        );
+
+        let with = run(&sock, &["ls", "--archived"]);
+        assert_success(&with);
+        let with_text = String::from_utf8_lossy(&with.stdout);
+        assert!(
+            with_text.contains(&id),
+            "ls --archived missing id:\n{with_text}"
+        );
+        assert!(
+            with_text.contains("archived"),
+            "ls --archived should mark the row"
+        );
+        assert!(!with_text.contains("archive-me"));
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn label_round_trips_on_ls_json() {
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        assert_success(&run_with_stdin(&sock, &["put"], b"tagged-item"));
+        assert_success(&run(&sock, &["label", "1", "ops"]));
+        let ls = run(&sock, &["ls", "--json"]);
+        assert_success(&ls);
+        let body = String::from_utf8_lossy(&ls.stdout);
+        assert!(body.contains("\"ops\""), "ls --json missing label:\n{body}");
+        assert!(!body.contains("tagged-item"));
 
         server.abort();
         let _ = server.await;

@@ -20,5 +20,7 @@ pub(crate) fn listed(item: shelf_store::ListedItem) -> ListedItem {
         created: item.created,
         pinned: item.pinned,
         expires_at: item.expires_at,
+        archived: item.archived,
+        labels: item.labels,
     }
 }

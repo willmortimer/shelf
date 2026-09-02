@@ -271,6 +271,8 @@ Suggested layout:
 
 Platform-specific wrappers may redirect this directory if required by sandboxing, but the logical layout and single-root model should remain intact.
 
+`state.db` object rows carry ciphertext plus listing metadata (`pinned`, `archived`, `labels`). `ls` omits archived objects unless the client requests them; search decrypts live non-archived objects in memory.
+
 The desktop GUI must never create a second independent configuration tree.
 
 ## Hardware-backed key providers

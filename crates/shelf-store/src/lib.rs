@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use shelf_core::enrollment::MembershipCertificate;
 use shelf_core::{
     ChunkId, ContentKind, DEFAULT_CHUNK_SIZE, DeviceId, EpochId, FileManifest, HlcClock,
-    HybridTimestamp, MembershipSnapshot, ObjectId, Retention, ScratchPad, Timestamp, VaultId,
-    scratch_id_for,
+    HybridTimestamp, Label, MembershipSnapshot, ObjectId, Retention, ScratchPad, Timestamp,
+    VaultId, scratch_id_for,
 };
 use shelf_protocol::{EncryptedObject, EpochKey, ProtocolError, open, seal_named};
 use thiserror::Error;
@@ -71,6 +71,12 @@ pub struct ListedItem {
     pub pinned: bool,
     /// Absolute expiration, if any.
     pub expires_at: Option<Timestamp>,
+    /// Hidden from default `ls` when true.
+    #[serde(default)]
+    pub archived: bool,
+    /// User labels (not payload).
+    #[serde(default)]
+    pub labels: Vec<Label>,
 }
 
 /// Decrypted object.
@@ -998,38 +1004,71 @@ impl SqliteStore {
         })
     }
 
-    /// Metadata only, newest first. Does not decrypt.
+    /// Metadata only, newest first. Does not decrypt payloads. Hides archived.
     pub fn ls(&self) -> Result<Vec<ListedItem>, StoreError> {
+        self.list_items(false)
+    }
+
+    /// Metadata only, newest first. `include_archived` shows archived rows too.
+    pub fn ls_with_archived(&self, include_archived: bool) -> Result<Vec<ListedItem>, StoreError> {
+        self.list_items(include_archived)
+    }
+
+    /// Decrypt live non-archived objects and match `query` case-insensitively
+    /// against UTF-8 plaintext and the optional envelope name. Empty query
+    /// returns no hits. Search is local decrypted-in-memory (no index).
+    pub fn search(&self, query: &str) -> Result<Vec<ListedItem>, StoreError> {
         self.gc_expired()?;
-        let mut stmt = self.conn.prepare(
-            "SELECT envelope, created_logical, created_wall, pinned, expires_at
-             FROM objects ORDER BY created_wall DESC, created_logical DESC, rowid DESC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let envelope_json: String = row.get(0)?;
-            let logical: i64 = row.get(1)?;
-            let wall: i64 = row.get(2)?;
-            let pinned: i64 = row.get(3)?;
-            let expires: Option<i64> = row.get(4)?;
-            Ok((envelope_json, logical, wall, pinned, expires))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (envelope_json, logical, wall, pinned, expires) = row?;
-            let envelope: EncryptedObject = serde_json::from_str(&envelope_json)?;
-            let kind = self
-                .open_env(&envelope)
-                .map(|o| o.content_kind)
-                .unwrap_or(ContentKind::OpaqueBytes);
-            out.push(ListedItem {
-                id: envelope.object_id,
-                kind,
-                created: HybridTimestamp::new(logical as u64, Timestamp::from_millis(wall as u64)),
-                pinned: pinned != 0,
-                expires_at: expires.map(|m| Timestamp::from_millis(millis_from_sql(m))),
-            });
+        if query.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let needle = query.to_lowercase();
+        let items = self.list_items(false)?;
+        let mut hits = Vec::new();
+        for item in items {
+            if self.item_matches_query(&item.id, &needle)? {
+                hits.push(item);
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Mark an object archived. It disappears from default [`Self::ls`].
+    pub fn archive(&mut self, target: &ItemTarget) -> Result<ObjectId, StoreError> {
+        let id = self.resolve_id(target)?;
+        let n = self.conn.execute(
+            "UPDATE objects SET archived = 1 WHERE object_id = ?1",
+            params![id.as_bytes().as_slice()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(id)
+    }
+
+    /// Attach a label to an object (set semantics; duplicates are ignored).
+    pub fn add_label(&mut self, target: &ItemTarget, name: &str) -> Result<ObjectId, StoreError> {
+        let id = self.resolve_id(target)?;
+        let json: String = self
+            .conn
+            .query_row(
+                "SELECT labels FROM objects WHERE object_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let mut labels = parse_labels_json(&json);
+        let label = Label::new(name);
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+        let written = serde_json::to_string(&labels)?;
+        self.conn.execute(
+            "UPDATE objects SET labels = ?1 WHERE object_id = ?2",
+            params![written, id.as_bytes().as_slice()],
+        )?;
+        Ok(id)
     }
 
     /// Decrypt the newest live object.
@@ -1244,16 +1283,100 @@ impl SqliteStore {
         )?)
     }
 
+    fn list_items(&self, include_archived: bool) -> Result<Vec<ListedItem>, StoreError> {
+        self.gc_expired()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT envelope, created_logical, created_wall, pinned, expires_at, archived, labels
+             FROM objects
+             WHERE ?1 != 0 OR archived = 0
+             ORDER BY created_wall DESC, created_logical DESC, rowid DESC",
+        )?;
+        let include = i64::from(include_archived);
+        let rows = stmt.query_map(params![include], |row| {
+            let envelope_json: String = row.get(0)?;
+            let logical: i64 = row.get(1)?;
+            let wall: i64 = row.get(2)?;
+            let pinned: i64 = row.get(3)?;
+            let expires: Option<i64> = row.get(4)?;
+            let archived: i64 = row.get(5)?;
+            let labels: String = row.get(6)?;
+            Ok((
+                envelope_json,
+                logical,
+                wall,
+                pinned,
+                expires,
+                archived,
+                labels,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (envelope_json, logical, wall, pinned, expires, archived, labels) = row?;
+            let envelope: EncryptedObject = serde_json::from_str(&envelope_json)?;
+            let kind = self
+                .open_env(&envelope)
+                .map(|o| o.content_kind)
+                .unwrap_or(ContentKind::OpaqueBytes);
+            out.push(ListedItem {
+                id: envelope.object_id,
+                kind,
+                created: HybridTimestamp::new(logical as u64, Timestamp::from_millis(wall as u64)),
+                pinned: pinned != 0,
+                expires_at: expires.map(|m| Timestamp::from_millis(millis_from_sql(m))),
+                archived: archived != 0,
+                labels: parse_labels_json(&labels),
+            });
+        }
+        Ok(out)
+    }
+
+    fn item_matches_query(&self, id: &ObjectId, needle: &str) -> Result<bool, StoreError> {
+        let json: String = self
+            .conn
+            .query_row(
+                "SELECT envelope FROM objects WHERE object_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let envelope: EncryptedObject = serde_json::from_str(&json)?;
+        let opened = match self.open_env(&envelope) {
+            Ok(opened) => opened,
+            Err(_) => return Ok(false),
+        };
+        if let Some(name) = opened.name.as_deref()
+            && name.to_lowercase().contains(needle)
+        {
+            return Ok(true);
+        }
+        if let Ok(text) = std::str::from_utf8(&opened.plaintext)
+            && text.to_lowercase().contains(needle)
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn insert_row(&self, row: StoredRow) -> Result<(), StoreError> {
         if self.is_tombstoned(row.envelope.object_id)? {
             return Ok(());
         }
         let json = serde_json::to_string(&row.envelope)?;
         let expires = row.expires_at.map(|t| t.as_millis() as i64);
+        // Preserve local archive/labels on ingest of an existing object.
         self.conn.execute(
-            "INSERT OR REPLACE INTO objects
-             (object_id, envelope, created_logical, created_wall, pinned, expires_at, name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO objects
+             (object_id, envelope, created_logical, created_wall, pinned, expires_at, name, archived, labels)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, '[]')
+             ON CONFLICT(object_id) DO UPDATE SET
+               envelope = excluded.envelope,
+               created_logical = excluded.created_logical,
+               created_wall = excluded.created_wall,
+               pinned = excluded.pinned,
+               expires_at = excluded.expires_at,
+               name = excluded.name",
             params![
                 row.envelope.object_id.as_bytes().as_slice(),
                 json,
@@ -1459,7 +1582,9 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
            created_wall INTEGER NOT NULL,
            pinned INTEGER NOT NULL,
            expires_at INTEGER,
-           name TEXT
+           name TEXT,
+           archived INTEGER NOT NULL DEFAULT 0,
+           labels TEXT NOT NULL DEFAULT '[]'
          );
          CREATE TABLE IF NOT EXISTS tombstones (
            object_id BLOB PRIMARY KEY,
@@ -1502,6 +1627,14 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
     let _ = conn.execute("ALTER TABLE scratch_pads ADD COLUMN snapshot TEXT", []);
     let _ = conn.execute("ALTER TABLE scratch_pads ADD COLUMN state_vector BLOB", []);
     let _ = conn.execute("ALTER TABLE ops ADD COLUMN dedupe TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE objects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE objects ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
     let _ = conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ops_dedupe ON ops(dedupe) WHERE dedupe IS NOT NULL",
         [],
@@ -1657,6 +1790,10 @@ fn persist_hlc(conn: &Connection, ts: HybridTimestamp) -> Result<(), StoreError>
         params![ts.wall().as_millis().to_le_bytes().as_slice()],
     )?;
     Ok(())
+}
+
+fn parse_labels_json(json: &str) -> Vec<Label> {
+    serde_json::from_str::<Vec<Label>>(json).unwrap_or_default()
 }
 
 fn meta_blob(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
@@ -2024,5 +2161,102 @@ mod tests {
             store.validated_members(),
             Err(StoreError::InvalidOp)
         ));
+    }
+
+    #[test]
+    fn search_hits_unique_plaintext_and_misses_absent() {
+        let mut store = SqliteStore::memory();
+        let payload = format!("find-payload-{}-{}", std::process::id(), ObjectId::new());
+        store
+            .put(payload.as_bytes().to_vec(), ContentKind::Text, None)
+            .unwrap();
+        store
+            .put(b"other-item".to_vec(), ContentKind::Text, None)
+            .unwrap();
+        let hits = store.search(&payload).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].archived);
+        let miss = store.search("no-such-substring-zzzz").unwrap();
+        assert!(miss.is_empty());
+        assert!(store.search("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_matches_envelope_name_case_insensitive() {
+        let mut store = SqliteStore::memory();
+        store
+            .put(
+                b"body-without-the-needle".to_vec(),
+                ContentKind::Text,
+                Some("KubeConfig".into()),
+            )
+            .unwrap();
+        let hits = store.search("kubeconfig").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn archive_hides_from_ls_until_included() {
+        let mut store = SqliteStore::memory();
+        let (id, _) = store
+            .put(b"keep-me".to_vec(), ContentKind::Text, None)
+            .unwrap();
+        assert_eq!(store.ls().unwrap().len(), 1);
+        store.archive(&ItemTarget::Id(id)).unwrap();
+        assert!(store.ls().unwrap().is_empty());
+        let all = store.ls_with_archived(true).unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].archived);
+        assert_eq!(all[0].id, id);
+        assert!(store.search("keep-me").unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_label_round_trips_on_listing() {
+        let mut store = SqliteStore::memory();
+        let (id, _) = store
+            .put(b"tagged".to_vec(), ContentKind::Text, None)
+            .unwrap();
+        store.add_label(&ItemTarget::Id(id), "ops").unwrap();
+        store.add_label(&ItemTarget::Id(id), "ops").unwrap();
+        let listed = store.ls().unwrap();
+        assert_eq!(listed[0].labels, vec![Label::new("ops")]);
+        store.archive(&ItemTarget::Index(1)).unwrap();
+        let archived = store.ls_with_archived(true).unwrap();
+        assert_eq!(archived[0].labels, vec![Label::new("ops")]);
+        assert!(archived[0].archived);
+    }
+
+    #[test]
+    fn schema_migration_defaults_archived_and_labels() {
+        let conn = open_conn_memory();
+        conn.execute_batch(
+            "CREATE TABLE objects (
+               object_id BLOB PRIMARY KEY,
+               envelope TEXT NOT NULL,
+               created_logical INTEGER NOT NULL,
+               created_wall INTEGER NOT NULL,
+               pinned INTEGER NOT NULL,
+               expires_at INTEGER,
+               name TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO objects(
+               object_id, envelope, created_logical, created_wall, pinned, expires_at, name
+             ) VALUES (?1, '{}', 0, 0, 0, NULL, NULL)",
+            params![[0u8; 32].as_slice()],
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let archived: i64 = conn
+            .query_row("SELECT archived FROM objects", [], |row| row.get(0))
+            .unwrap();
+        let labels: String = conn
+            .query_row("SELECT labels FROM objects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(archived, 0);
+        assert_eq!(labels, "[]");
     }
 }

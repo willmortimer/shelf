@@ -197,18 +197,27 @@ async fn read_bounded_utf8<R: tokio::io::AsyncRead + Unpin>(
 
 #[cfg(any(unix, windows))]
 fn mutates_store(req: &IpcRequest) -> bool {
-    matches!(
-        req,
+    match req {
         IpcRequest::Put { .. }
-            | IpcRequest::PutFile { .. }
-            | IpcRequest::Pin { .. }
-            | IpcRequest::Rm { .. }
-            | IpcRequest::ScratchAppend { .. }
-            | IpcRequest::EnrollExport
-            | IpcRequest::EnrollApprove { .. }
-            | IpcRequest::EnrollImport { .. }
-            | IpcRequest::DevicesRevoke { .. }
-    )
+        | IpcRequest::PutFile { .. }
+        | IpcRequest::Pin { .. }
+        | IpcRequest::Rm { .. }
+        | IpcRequest::ScratchAppend { .. }
+        | IpcRequest::EnrollExport
+        | IpcRequest::EnrollApprove { .. }
+        | IpcRequest::EnrollImport { .. }
+        | IpcRequest::DevicesRevoke { .. }
+        | IpcRequest::Archive { .. }
+        | IpcRequest::Label { .. } => true,
+        IpcRequest::Ls { .. }
+        | IpcRequest::Latest
+        | IpcRequest::Get { .. }
+        | IpcRequest::ScratchGet { .. }
+        | IpcRequest::RecoveryExport { .. }
+        | IpcRequest::RecoveryApply { .. }
+        | IpcRequest::DevicesList
+        | IpcRequest::Search { .. } => false,
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -247,10 +256,24 @@ fn dispatch(
                 },
             }
         }
-        IpcRequest::Ls => match store.ls() {
+        IpcRequest::Ls { include_archived } => match store.ls_with_archived(include_archived) {
             Ok(items) => IpcResponse::Ls {
                 items: items.into_iter().map(listed).collect(),
             },
+            Err(err) => store_error(err),
+        },
+        IpcRequest::Search { query } => match store.search(&query) {
+            Ok(items) => IpcResponse::Search {
+                items: items.into_iter().map(listed).collect(),
+            },
+            Err(err) => store_error(err),
+        },
+        IpcRequest::Archive { target } => match store.archive(&ipc_target(&target)) {
+            Ok(id) => IpcResponse::Archive { id },
+            Err(err) => store_error(err),
+        },
+        IpcRequest::Label { target, name } => match store.add_label(&ipc_target(&target), &name) {
+            Ok(id) => IpcResponse::Label { id },
             Err(err) => store_error(err),
         },
         IpcRequest::Latest => match store.latest() {
