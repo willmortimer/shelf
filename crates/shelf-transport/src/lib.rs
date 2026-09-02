@@ -10,15 +10,13 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-use shelf_core::{Peer, PeerId, PeerTransport};
-use shelf_store::SealedRecord;
+use shelf_core::{ContentKind, Peer, PeerId, PeerTransport};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
 
 mod codec;
 mod frame;
+mod lan;
 mod session;
 
 pub use codec::{PeerFrame, read_peer_frame, write_peer_frame};
@@ -26,6 +24,7 @@ pub use frame::{
     OpBody, OriginCursor, PeerMessage, ReplicaFrame, SignedOperation, new_op_id, parse_sig_hex,
     sig_hex,
 };
+pub use lan::LanTransport;
 pub use session::{
     PEER_ALPN_V1, PEER_ALPN_V2, PeerClientTls, SessionHello, accept_tls, accept_tls_v2,
     connect_tls, connect_tls_v2, hello_transcript, read_bounded_line, tls_exporter_client,
@@ -48,6 +47,20 @@ pub enum TransportError {
     Tailscale(String),
 }
 
+/// Replica transfer policy from `~/.shelf/config.toml` `sync_mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Skip file/chunk payloads on relayed Tailscale; send them on LAN and direct Tailscale.
+    #[default]
+    Auto,
+    /// Same file/chunk skip as [`Self::Auto`] (prefer local/direct paths).
+    PreferDirect,
+    /// Send every op to every pooled address.
+    Always,
+    /// Same file/chunk skip as [`Self::Auto`] (defer bulk over DERP).
+    Metered,
+}
+
 /// Non-secret preferences from `~/.shelf/config.toml`.
 #[derive(Clone, Debug, Default)]
 pub struct HomeConfig {
@@ -57,6 +70,13 @@ pub struct HomeConfig {
     pub lan_port: u16,
     /// TCP port for framed Tailscale/LAN peer sessions.
     pub peer_port: u16,
+    /// Extra `host:port` replica dials (comma-separated). Treated as LAN paths.
+    ///
+    /// Use when DNS-SD cannot see a peer (WSL NAT) or Tailscale ACLs block
+    /// `peer_port`, but a LAN or forwarded socket still answers `shelf/2`.
+    pub peer_addrs: Vec<SocketAddr>,
+    /// File/chunk fan-out policy. Defaults to [`SyncMode::Auto`].
+    pub sync_mode: SyncMode,
 }
 
 /// Parse a tiny TOML subset: `key = "value"` and `key = 123`.
@@ -66,6 +86,8 @@ pub fn parse_home_config(path: &Path) -> HomeConfig {
         mailbox_url: None,
         lan_port: 18732,
         peer_port: 18733,
+        peer_addrs: Vec::new(),
+        sync_mode: SyncMode::Auto,
     };
     let Ok(text) = std::fs::read_to_string(path) else {
         return cfg;
@@ -96,10 +118,64 @@ pub fn parse_home_config(path: &Path) -> HomeConfig {
                     cfg.peer_port = p;
                 }
             }
+            "peer_addrs" => cfg.peer_addrs = parse_peer_addrs(val),
+            "sync_mode" => cfg.sync_mode = parse_sync_mode(val),
             _ => {}
         }
     }
     cfg
+}
+
+fn parse_peer_addrs(val: &str) -> Vec<SocketAddr> {
+    val.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            part.parse().ok()
+        })
+        .collect()
+}
+
+fn parse_sync_mode(val: &str) -> SyncMode {
+    match val {
+        "auto" => SyncMode::Auto,
+        "prefer_direct" => SyncMode::PreferDirect,
+        "always" => SyncMode::Always,
+        "metered" => SyncMode::Metered,
+        _ => SyncMode::Auto,
+    }
+}
+
+/// Whether a file/chunk payload should be written on this path.
+///
+/// `always` sends bulk on every address. `auto`, `prefer_direct`, and `metered`
+/// skip bulk on a relayed Tailscale path. Callers still send Hello/Have and
+/// non-file ops everywhere. Missing `tailscale status` should pass
+/// `path_is_relayed_tailscale = false` (fail open).
+#[must_use]
+pub fn should_send_file_op(mode: SyncMode, path_is_relayed_tailscale: bool) -> bool {
+    match mode {
+        SyncMode::Always => true,
+        SyncMode::Auto | SyncMode::PreferDirect | SyncMode::Metered => !path_is_relayed_tailscale,
+    }
+}
+
+/// File/chunk bodies that Transfer policy may skip on a relayed Tailscale path.
+///
+/// v2 [`OpBody::Put`] envelopes omit `content_kind` on the wire; callers with a
+/// local epoch key should also treat opened [`ContentKind::File`] puts as file ops.
+#[must_use]
+pub fn is_file_transfer_op(body: &OpBody) -> bool {
+    match body {
+        OpBody::Chunk { .. } | OpBody::NeedChunks { .. } => true,
+        OpBody::Put { envelope } => matches!(envelope.content_kind, Some(ContentKind::File)),
+        OpBody::Pin { .. }
+        | OpBody::Tombstone { .. }
+        | OpBody::Scratch { .. }
+        | OpBody::EpochTransition { .. } => false,
+    }
 }
 
 /// Host Tailscale snapshot (`tailscale status --json`).
@@ -257,6 +333,23 @@ pub fn dial_addrs(
         .collect()
 }
 
+/// True when `addr` is a Tailscale IP of a peer whose current path is DERP
+/// (`CurAddr` empty). Addresses not in the snapshot are treated as direct.
+///
+/// LAN addresses are a separate replica path and must not be classified with
+/// this helper; pass them as not-relayed at the call site.
+#[must_use]
+pub fn is_relayed_tailscale_path(status: &TailscaleStatus, addr: SocketAddr) -> bool {
+    let ip = addr.ip().to_string();
+    status.peers.iter().any(|peer| {
+        peer.relayed
+            && peer
+                .ips
+                .iter()
+                .any(|peer_ip| canonical_ip(peer_ip).as_deref() == Some(ip.as_str()))
+    })
+}
+
 fn hint_host(address: &str) -> &str {
     if let Some(rest) = address.strip_prefix('[')
         && let Some(end) = rest.find(']')
@@ -289,7 +382,7 @@ fn parse_socket_addr(ip: &str, port: u16) -> Option<SocketAddr> {
     format!("[{ip}]:{port}").parse().ok()
 }
 
-fn peer_id_from_key(key: &[u8]) -> PeerId {
+pub(crate) fn peer_id_from_key(key: &[u8]) -> PeerId {
     PeerId::from_bytes(*blake3::hash(key).as_bytes())
 }
 
@@ -340,75 +433,6 @@ pub async fn send_replica_line(addr: SocketAddr, line: &[u8]) -> Result<(), Tran
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
-struct LanPacket {
-    v: u16,
-    kind: String,
-    payload: serde_json::Value,
-}
-
-/// LAN UDP transport. Discovery does not confer membership.
-pub struct LanTransport {
-    socket: UdpSocket,
-    port: u16,
-}
-
-impl LanTransport {
-    /// Bind `0.0.0.0:port` (or ephemeral if `port` is 0).
-    pub async fn bind(port: u16) -> Result<Self, TransportError> {
-        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
-        socket.set_broadcast(true)?;
-        let port = socket.local_addr()?.port();
-        Ok(Self { socket, port })
-    }
-
-    /// Broadcast a presence packet (`_shelf._udp` analogue).
-    pub async fn announce(&self) -> Result<(), TransportError> {
-        let pkt = LanPacket {
-            v: 1,
-            kind: "announce".into(),
-            payload: serde_json::json!({ "port": self.port }),
-        };
-        let bytes = serde_json::to_vec(&pkt)?;
-        let _ = self
-            .socket
-            .send_to(&bytes, SocketAddr::from(([255, 255, 255, 255], self.port)))
-            .await;
-        Ok(())
-    }
-
-    /// Broadcast a sealed object record (ciphertext JSON).
-    pub async fn broadcast_object(&self, record: &SealedRecord) -> Result<(), TransportError> {
-        let pkt = LanPacket {
-            v: 1,
-            kind: "object".into(),
-            payload: serde_json::to_value(record)?,
-        };
-        let bytes = serde_json::to_vec(&pkt)?;
-        let _ = self
-            .socket
-            .send_to(&bytes, SocketAddr::from(([255, 255, 255, 255], self.port)))
-            .await;
-        Ok(())
-    }
-}
-
-impl PeerTransport for LanTransport {
-    type Connection = SocketAddr;
-    type Error = TransportError;
-
-    async fn discover(&self) -> Vec<Peer> {
-        let _ = self.announce().await;
-        Vec::new()
-    }
-
-    async fn connect(&self, _peer: PeerId) -> Result<Self::Connection, Self::Error> {
-        Err(TransportError::Io(std::io::Error::other(
-            "LAN connect requires an explicit address hint",
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,7 +451,78 @@ mod tests {
         assert_eq!(cfg.mailbox_url.as_deref(), Some("127.0.0.1:8743"));
         assert_eq!(cfg.lan_port, 19000);
         assert_eq!(cfg.peer_port, 19100);
+        assert_eq!(cfg.sync_mode, SyncMode::Auto);
+        assert!(cfg.peer_addrs.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_peer_addrs_comma_separated() {
+        let dir = std::env::temp_dir().join(format!("shelf-cfg-peers-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "peer_addrs = \"10.10.30.148:18733, 192.0.2.10:19100\"\n",
+        )
+        .unwrap();
+        let cfg = parse_home_config(&path);
+        assert_eq!(
+            cfg.peer_addrs,
+            vec![
+                "10.10.30.148:18733".parse().unwrap(),
+                "192.0.2.10:19100".parse().unwrap(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_sync_mode_values() {
+        let dir = std::env::temp_dir().join(format!("shelf-cfg-sync-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        for (raw, want) in [
+            ("auto", SyncMode::Auto),
+            ("prefer_direct", SyncMode::PreferDirect),
+            ("always", SyncMode::Always),
+            ("metered", SyncMode::Metered),
+        ] {
+            std::fs::write(&path, format!("sync_mode = \"{raw}\"\n")).unwrap();
+            assert_eq!(parse_home_config(&path).sync_mode, want, "{raw}");
+        }
+        std::fs::write(
+            &path,
+            "not_a_key = \"ignored\"\nsync_mode = \"bogus\"\npeer_port = 19100\n",
+        )
+        .unwrap();
+        let cfg = parse_home_config(&path);
+        assert_eq!(cfg.sync_mode, SyncMode::Auto);
+        assert_eq!(cfg.peer_port, 19100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_send_file_op_skips_relayed_except_always() {
+        assert!(should_send_file_op(SyncMode::Always, true));
+        assert!(should_send_file_op(SyncMode::Always, false));
+        for mode in [SyncMode::Auto, SyncMode::PreferDirect, SyncMode::Metered] {
+            assert!(!should_send_file_op(mode, true), "{mode:?}");
+            assert!(should_send_file_op(mode, false), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn is_file_transfer_op_matches_chunk_and_need() {
+        use shelf_core::{ObjectId, Timestamp};
+        assert!(is_file_transfer_op(&OpBody::NeedChunks {
+            parent: ObjectId::new(),
+            chunk_ids: Vec::new(),
+        }));
+        assert!(!is_file_transfer_op(&OpBody::Pin {
+            object_id: ObjectId::new(),
+            at: Timestamp::now(),
+        }));
     }
 
     #[test]
@@ -515,6 +610,17 @@ mod tests {
             addrs,
             vec!["100.64.0.1:18733".parse::<SocketAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn relayed_tailscale_path_follows_cur_addr() {
+        let status = parse_tailscale_json(two_peer_status_json()).unwrap();
+        let direct: SocketAddr = "100.64.0.1:18733".parse().unwrap();
+        let relayed: SocketAddr = "100.64.0.2:18733".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.10:18733".parse().unwrap();
+        assert!(!is_relayed_tailscale_path(&status, direct));
+        assert!(is_relayed_tailscale_path(&status, relayed));
+        assert!(!is_relayed_tailscale_path(&status, lan));
     }
 
     #[tokio::test]

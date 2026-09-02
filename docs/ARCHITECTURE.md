@@ -64,8 +64,9 @@ Clients include:
 
 Because iOS does not allow a permanent arbitrary user daemon, the same core
 libraries are embedded in-process via `crates/shelf-mobile` (`MobileSession`).
-Share Sheet and App Intent stubs live in `apps/shelf-ios/` (not a Cargo
-member). Replication is opportunistic when the app or extension is running.
+Share Sheet and App Intent Swift call sites live in `apps/shelf-ios/` (not a
+Cargo member) and link `libshelf_mobile.a`. Replication is opportunistic
+(`MobileSession::sync_once`) when the app or extension is running.
 
 ## Crate structure
 
@@ -182,16 +183,14 @@ Shelf may inspect whether a peer path is direct or relayed to make bandwidth dec
 
 ## LAN transport
 
-LAN discovery may use mDNS/DNS-SD, for example:
+LAN discovery uses mDNS/DNS-SD `_shelf._udp.local` (implemented) plus a UDP announce fallback on `lan_port`. `_shelf-enroll._udp.local` is reserved for enrollment and is not registered by `shelfd`.
 
 ```text
 _shelf._udp.local
 _shelf-enroll._udp.local
 ```
 
-Discovery reveals only minimal routing/version metadata.
-
-Discovery does not confer trust. An attacker on the LAN may discover a daemon but cannot become a Shelf member without an authenticated enrollment grant.
+DNS-SD SRV records advertise this daemon's `peer_port`. Announce/browse carry routing metadata only; sealed objects and replica ops stay on rustls ALPN `shelf/2`. Discovery does not confer trust: an attacker on the LAN may discover a daemon but cannot become a Shelf member without an authenticated enrollment grant, and a failed membership hello never receives ciphertext.
 
 ## Mailbox transport
 
@@ -271,6 +270,8 @@ Suggested layout:
 ```
 
 Platform-specific wrappers may redirect this directory if required by sandboxing, but the logical layout and single-root model should remain intact.
+
+`state.db` object rows carry ciphertext plus listing metadata (`pinned`, `archived`, `labels`). `ls` omits archived objects unless the client requests them; search decrypts live non-archived objects in memory.
 
 The desktop GUI must never create a second independent configuration tree.
 

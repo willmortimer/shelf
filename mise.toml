@@ -1,2 +1,60 @@
 [tools]
 rust = { version = "1.98.0", components = "rustfmt,clippy,rust-src" }
+
+[tasks.fmt]
+description = "Format all Rust sources"
+run = "cargo fmt --all"
+
+[tasks.clippy]
+description = "Lint the workspace with warnings as errors"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run workspace tests"
+run = "cargo test --workspace"
+
+[tasks.install]
+description = "Install shelfd, shelf, and shelf-desktop into ~/.cargo/bin"
+run = "cargo install --path apps/shelfd --force && cargo install --path apps/shelf-cli --force && cargo install --path apps/shelf-desktop --force"
+
+[tasks.install-macos]
+description = "Install binaries and load the launchd user agent"
+depends = ["install"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+dest="$HOME/Library/LaunchAgents/com.shelf.shelfd.plist"
+mkdir -p "$HOME/Library/LaunchAgents"
+cp contrib/launchd/com.shelf.shelfd.plist "$dest"
+cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+# launchd does not expand ~; put an absolute cargo bin dir on PATH so /usr/bin/env finds shelfd.
+if [ -x /usr/libexec/PlistBuddy ]; then
+  /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:PATH ${cargo_bin}:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin" "$dest"
+fi
+domain="gui/$(id -u)"
+label="com.shelf.shelfd"
+launchctl bootout "${domain}/${label}" 2>/dev/null || true
+if launchctl bootstrap "$domain" "$dest"; then
+  launchctl enable "${domain}/${label}" 2>/dev/null || true
+  launchctl kickstart -k "${domain}/${label}" 2>/dev/null || true
+else
+  launchctl load -w "$dest"
+fi
+"""
+
+[tasks.install-linux]
+description = "Install binaries and enable the systemd user unit"
+depends = ["install"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "install-linux: systemctl not found" >&2
+  exit 1
+fi
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+mkdir -p "$unit_dir"
+cp contrib/systemd/shelfd.service "$unit_dir/shelfd.service"
+systemctl --user daemon-reload
+systemctl --user enable --now shelfd.service
+"""

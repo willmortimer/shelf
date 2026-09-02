@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  User agent for shelfd. Copy to ~/Library/LaunchAgents (mise run install-macos).
+
+  launchd does not expand ~. ProgramArguments uses /usr/bin/env so the PATH
+  below can locate ~/.cargo/bin/shelfd. install-macos prepends the absolute
+  cargo bin dir to PATH. For a hand-copied plist, either keep that PATH
+  rewrite or replace the second ProgramArguments entry with an absolute path.
+
+  Do not put SHELF_PASSPHRASE in this file. Prefer platform Keychain wrap
+  (default shelf init). Passphrase vaults: see docs/INSTALL.md.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.shelf.shelfd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/env</string>
+		<string>shelfd</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>

@@ -323,6 +323,8 @@ Removing a device:
 
 The removed device retains whatever old data it previously possessed but cannot decrypt objects created under the new epoch.
 
+Only the vault root may revoke. Use `shelf devices` to list members and `shelf devices revoke <device-id>` to rotate the epoch and drop a member.
+
 ## Recovery and the last device
 
 A mailbox cannot recover a lost vault because it has no keys.

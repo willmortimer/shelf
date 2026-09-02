@@ -14,7 +14,8 @@ mod path;
 pub use client::Client;
 pub use error::ClientError;
 pub use ipc::{
-    GetTarget, IpcErrorCode, IpcRequest, IpcResponse, ListedItem, ObjectPayload, PutResult,
+    GetTarget, IpcErrorCode, IpcRequest, IpcResponse, ListedDevice, ListedItem, ObjectPayload,
+    PutResult,
 };
 pub use path::{
     RUNTIME_DIR_NAME, SOCKET_FILE_NAME, default_shelf_home, default_socket_path,

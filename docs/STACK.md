@@ -59,9 +59,9 @@ Invariant: `shelf-core` must not depend on `shelf-mailbox`.
 - Userland state root: `~/.shelf/` (`config.toml`, `state.db`, objects, chunks, logs, runtime, cache, export, enrollment).
 - `shelf init` / `shelf enroll` write identity + vault under `--home`. Wrap-key custody is platform store or `--passphrase`; `--allow-file-key` is required for 0600 `wrap.key`. iOS never uses file wrap. When `shelfd` is up, `shelf enroll` uses local IPC against the daemon's open vault; when the daemon is down, the CLI opens the vault directly.
 - `shelf recovery export --out` writes a passphrase-wrapped `.shelfrecovery` (`shelf/recovery/v1`: Argon2id + XChaCha20-Poly1305). Passphrase is a hidden TTY or `SHELF_RECOVERY_PASSPHRASE` (not argv). Export uses IPC when `shelfd` is up. `shelf recovery apply --from` is always CLI-direct against an empty `--home` and restores the existing `VaultRoot`. A mailbox cannot recover a vault.
-- Replica fan-out: host `tailscale status --json` (no tsnet), rustls `shelf/2` peer sessions on `peer_port` (default 18733) exchanging `Have` cursors and missing signed ops from a durable op log. Outbound TLS is pooled by dial `SocketAddr` and kept across notify/30s ticks (reconnect on I/O error). Tailscale dials only online IPs that also appear in verified member routing hints; an empty hint set does not spray the tailnet (mailbox/LAN still run). LAN UDP discovery (`lan_port`, default 18732) without ciphertext flood, optional mailbox at `mailbox_url` (mailbox items must be signed frames, PUT to peer write caps). Put/pin/rm/scratch notify the replica immediately. Mailbox protocol is newline JSON PUT/GET/ACK with per-mailbox write/read capabilities; default listen `127.0.0.1:8743` and persist path `--data shelf-mailbox.json`. IPC, mailbox, and peer frames are bounded at 8 MiB. `shelfd` unlocks passphrase vaults via systemd `CREDENTIALS_DIRECTORY`/`shelf.passphrase`, `--passphrase-fd`, `SHELF_PASSPHRASE`, or a hidden TTY prompt. `shelf put --file` sends a path; the daemon streams 4 MiB chunks.
+- Replica fan-out: host `tailscale status --json` (no tsnet), rustls `shelf/2` peer sessions on `peer_port` (default 18733) exchanging `Have` cursors and missing signed ops from a durable op log. Outbound TLS is pooled by dial `SocketAddr` and kept across notify/30s ticks (reconnect on I/O error). Tailscale dials only online IPs that also appear in verified member routing hints; an empty hint set does not spray the tailnet (mailbox/LAN still run). LAN DNS-SD `_shelf._udp.local` advertises `peer_port` (UDP announce on `lan_port`, default 18732, as fallback) without ciphertext flood; discovered LAN addrs join the outbound TLS pool separately from Tailscale `dial_addrs`. `config.toml` `peer_addrs` is a comma-separated list of extra `host:port` dials for the same pool (WSL NAT / firewall escape hatch; treated as LAN, not Tailscale). `config.toml` `sync_mode` (`auto` default; also `prefer_direct`, `always`, `metered`) skips file/chunk ops on relayed Tailscale paths while LAN and direct Tailscale still transfer files. Optional mailbox at `mailbox_url` (mailbox items must be signed frames, PUT to peer write caps). Put/pin/rm/scratch notify the replica immediately. Mailbox protocol is newline JSON PUT/GET/ACK with per-mailbox write/read capabilities; default listen `127.0.0.1:8743` and persist path `--data shelf-mailbox.json`. IPC, mailbox, and peer frames are bounded at 8 MiB. `shelfd` unlocks passphrase vaults via systemd `CREDENTIALS_DIRECTORY`/`shelf.passphrase`, `--passphrase-fd`, `SHELF_PASSPHRASE`, or a hidden TTY prompt. `shelf put --file` sends a path; the daemon streams 4 MiB chunks.
 - Desktop GUI must not own a second configuration tree. `shelf-desktop` is a searchable palette (copy-on-select). Bind an OS keyboard shortcut to the `shelf-desktop` binary for a global hotkey.
-- iOS: `crates/shelf-mobile` in-process session; Swift stubs in `apps/shelf-ios/` (not a Cargo member). Windows IPC: named pipes `\\.\pipe\shelf-<hash>`.
+- iOS: `crates/shelf-mobile` in-process session with a thin C ABI (`staticlib` + `include/shelf_mobile.h`); Swift call sites in `apps/shelf-ios/` (not a Cargo member). Windows IPC: named pipes `\\.\pipe\shelf-<hash>`.
 
 Peer TLS ALPN `shelf/2` is length-prefixed binary (`SHLF` + version + big-endian `u32` length + a hand-encoded Hello/Have/Op payload). Replica peers use `shelf/2` only (no bare `SignedOperation` JSON on that path). Mailbox and local IPC remain newline-delimited JSON.
 
@@ -70,17 +70,17 @@ Peer TLS ALPN `shelf/2` is length-prefixed binary (`SHLF` + version + big-endian
 Listed for later implementation; not added to manifests in the bootstrap pass.
 
 - CRDT text: Yrs (`yrs`) for scratchpads (design pack suggested Automerge; implementation uses Yrs). After the first write, persist seals a Yrs update encoded from the last-applied state vector rather than a full empty-SV document.
-- Local store: SQLite via `rusqlite` (bundled)
+- Local store: SQLite via `rusqlite` (bundled). Object listing metadata includes pin, archive, and labels (no plaintext); `ls` omits archived rows unless `shelf ls --archived`. `shelf search` decrypts live non-archived objects in memory and matches a case-insensitive substring on UTF-8 plaintext and optional name (no searchable encryption).
 - Crypto providers: X25519, ML-KEM-768, XChaCha20-Poly1305, Argon2id, keyed BLAKE3
 - Desktop: Slint
 - CLI: clap
-- Discovery: mDNS/DNS-SD for LAN (`_shelf._udp.local`, `_shelf-enroll._udp.local`) — not pinned yet
+- Discovery: mDNS/DNS-SD via `mdns-sd` (`_shelf._udp.local` implemented; `_shelf-enroll._udp.local` reserved)
 
 Versions live in the workspace `[workspace.dependencies]` table.
 
 ## Packaging / CI
 
-Dev pin: `mise.toml` (`rust` 1.98.0 with rustfmt, clippy, rust-src). CI: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` on Ubuntu, macOS, and Windows. The `required` job is the merge gate. `main` should require that check before merge.
+Dev pin: `mise.toml` (`rust` 1.98.0 with rustfmt, clippy, rust-src). CI: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` on Ubuntu, macOS, and Windows. The `required` job is the merge gate. `main` should require that check before merge. User-service units (launchd, systemd `--user`, Windows Startup) live under `contrib/`; first-run steps are in [INSTALL.md](INSTALL.md).
 
 ## License
 

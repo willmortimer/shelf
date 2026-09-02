@@ -99,7 +99,7 @@ Cmd/Ctrl + Shift + V
 
 opens a searchable recent-item palette.
 
-`shelf-desktop` is that palette. Bind the OS global shortcut to the `shelf-desktop` binary (the app does not register a hotkey crate; that keeps CI and Wayland simple). Type to filter by kind or id. Click, or press Return on a match, copies the item into the system clipboard and closes the palette. The user then uses the normal paste shortcut.
+`shelf-desktop` is a small Slint app: the Shelf palette plus Capture, Scratch, Transfers, Devices, and Settings tabs over `shelfd` IPC. Bind the OS global shortcut to the `shelf-desktop` binary (the app does not register a hotkey crate; that keeps CI and Wayland simple). On the Shelf tab, type to filter by kind or id. Click, or press Return on a match, copies the item into the system clipboard. The user then uses the normal paste shortcut.
 
 This avoids depending on cross-platform synthetic keystroke injection, especially on Wayland.
 
@@ -145,7 +145,11 @@ shelf latest
 shelf latest | jq .
 shelf get 4 > file.bin
 shelf ls
+shelf devices
+shelf devices revoke <device-id>
 shelf search kubernetes
+shelf archive 3
+shelf label 2 ops
 shelf pin 2
 shelf rm 5
 shelf scratch
@@ -185,7 +189,7 @@ App Intent → Fetch Latest Shelf Item
 
 This enables use from the Action Button, Control Center, Siri, Spotlight, Back Tap, and Shortcuts without requiring continuous clipboard monitoring.
 
-There is no always-on `shelfd` on iOS. `crates/shelf-mobile` opens the vault in-process; Swift Share Sheet / App Intent stubs in `apps/shelf-ios/` are the intended call sites.
+There is no always-on `shelfd` on iOS. `crates/shelf-mobile` opens the vault in-process over a thin C ABI (`include/shelf_mobile.h`); Swift Share Sheet / App Intent call sites in `apps/shelf-ios/` invoke those functions.
 
 ## File transfer
 
@@ -266,6 +270,16 @@ This prevents ancient offline replicas from resurrecting content that has alread
 ## Transfer policy
 
 Shelf can make transport-aware decisions without weakening cryptographic guarantees.
+
+v1 reads `sync_mode` from `~/.shelf/config.toml` (`auto`, `prefer_direct`, `always`, `metered`; default `auto`):
+
+```toml
+# sync_mode = "auto"
+```
+
+`always` sends every Have/Op to every pooled address.
+
+`auto`, `prefer_direct`, and `metered` still send Hello/Have and non-file ops on every path. They skip `Put` of `ContentKind::File`, `Chunk`, and `NeedChunks` on **relayed Tailscale** addresses (`tailscale status --json` `CurAddr` empty). LAN addresses and direct Tailscale addresses still get file/chunk ops. If `tailscale status` is missing, fail open and treat the path as direct.
 
 Suggested modes:
 

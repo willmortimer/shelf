@@ -15,5 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 shelf-client.workspace = true
+shelf-core.workspace = true
 slint.workspace = true
 tokio.workspace = true

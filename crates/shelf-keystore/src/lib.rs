@@ -14,7 +14,10 @@ pub use enroll::{
     export_join_store, grant_sas, import_grant, import_grant_store,
 };
 pub use recovery::{RecoveryBundle, apply_recovery, export_recovery, export_recovery_store};
-pub use vault::{Vault, ensure_home_layout, open_or_create_vault, revoke_device};
+pub use vault::{
+    DeviceListEntry, Vault, ensure_home_layout, list_devices_store, open_or_create_vault,
+    revoke_device, revoke_device_store,
+};
 
 use std::fs;
 use std::io::{self, Write};
@@ -620,6 +623,58 @@ mod tests {
             .unwrap();
         let opened = joiner.store.get(&shelf_store::ItemTarget::Id(id)).unwrap();
         assert_eq!(opened.bytes, payload);
+    }
+
+    #[test]
+    fn list_then_root_revoke_drops_joiner() {
+        let member_dir = tempfile::tempdir().unwrap();
+        let join_dir = tempfile::tempdir().unwrap();
+        let mut member =
+            crate::open_or_create_vault(member_dir.path(), Some("mac"), None, true).unwrap();
+        let mut joiner =
+            crate::open_or_create_vault(join_dir.path(), Some("linux"), None, true).unwrap();
+        let joiner_id = joiner.keys.public_identity().device_id;
+        let (join, _) = crate::export_join(&joiner, Vec::new()).unwrap();
+        let (grant, grant_sas) = crate::approve_join(&member, &join).unwrap();
+        crate::import_grant(&mut joiner, &grant, &grant_sas).unwrap();
+
+        let listed = crate::list_devices_store(&member.keys, &member.store).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|d| d.is_root));
+        assert!(
+            listed
+                .iter()
+                .any(|d| d.device_id == joiner_id && !d.is_root)
+        );
+
+        crate::revoke_device(&mut member, joiner_id).unwrap();
+        let after = crate::list_devices_store(&member.keys, &member.store).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after[0].is_root);
+        assert_ne!(after[0].device_id, joiner_id);
+    }
+
+    #[test]
+    fn non_root_revoke_fails_typed() {
+        let member_dir = tempfile::tempdir().unwrap();
+        let join_dir = tempfile::tempdir().unwrap();
+        let member =
+            crate::open_or_create_vault(member_dir.path(), Some("mac"), None, true).unwrap();
+        let mut joiner =
+            crate::open_or_create_vault(join_dir.path(), Some("linux"), None, true).unwrap();
+        let root_id = member.keys.public_identity().device_id;
+        let (join, _) = crate::export_join(&joiner, Vec::new()).unwrap();
+        let (grant, grant_sas) = crate::approve_join(&member, &join).unwrap();
+        crate::import_grant(&mut joiner, &grant, &grant_sas).unwrap();
+
+        let err = crate::revoke_device(&mut joiner, root_id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only the vault root can revoke a device"),
+            "typed root-only failure, got {msg:?}"
+        );
+        assert!(!msg.contains("wrap.key"));
+        assert!(!msg.contains("correct horse"));
     }
 
     #[test]

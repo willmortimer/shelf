@@ -9,14 +9,15 @@ use std::time::Duration;
 use crate::store::MemoryStore;
 #[cfg(test)]
 use shelf_core::VaultId;
-use shelf_core::{DeviceId, ObjectId, SigningPublicKey, Timestamp, TransportHint};
+use shelf_core::{ContentKind, DeviceId, ObjectId, SigningPublicKey, Timestamp, TransportHint};
 use shelf_keystore::{DeviceSigner, verify_signature};
 use shelf_protocol::EncryptedObject;
 use shelf_store::SqliteStore;
 use shelf_transport::{
-    LanTransport, MailboxClient, OpBody, OriginCursor, PeerClientTls, PeerFrame, PeerMessage,
-    ReplicaFrame, SessionHello, SignedOperation, accept_tls_v2, connect_tls_v2, dial_addrs,
-    hello_transcript, new_op_id, parse_home_config, parse_sig_hex, read_peer_frame, sig_hex,
+    HomeConfig, LanTransport, MailboxClient, OpBody, OriginCursor, PeerClientTls, PeerFrame,
+    PeerMessage, ReplicaFrame, SessionHello, SignedOperation, SyncMode, accept_tls_v2,
+    connect_tls_v2, dial_addrs, hello_transcript, is_file_transfer_op, is_relayed_tailscale_path,
+    new_op_id, parse_home_config, parse_sig_hex, read_peer_frame, should_send_file_op, sig_hex,
     tailscale_status, tls_exporter_client, tls_exporter_server, write_peer_frame,
 };
 use tokio::net::{TcpListener, TcpStream};
@@ -24,6 +25,13 @@ use tokio::sync::Notify;
 
 /// How long a pooled peer wait (Have reply or handshake frame) may block.
 const PEER_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// File/chunk skip for one outbound address.
+#[derive(Clone, Copy)]
+struct FileOpPolicy {
+    mode: SyncMode,
+    path_is_relayed: bool,
+}
 
 /// Outbound rustls sessions keyed by the T1 dial set (`SocketAddr`).
 #[derive(Default)]
@@ -58,7 +66,7 @@ async fn replica_loop(
         Some(addr) if !addr.is_empty() => MailboxClient::connect(addr).await.ok(),
         _ => None,
     };
-    let lan = LanTransport::bind(cfg.lan_port).await.ok();
+    let lan = LanTransport::bind(cfg.lan_port, cfg.peer_port).await.ok();
     let mailbox_id = {
         let store = store
             .lock()
@@ -94,7 +102,7 @@ async fn replica_loop(
             mailbox.as_ref(),
             &mailbox_id,
             lan.as_ref(),
-            cfg.peer_port,
+            &cfg,
             &mut pool,
         )
         .await;
@@ -320,7 +328,7 @@ async fn push_now(
     mailbox: Option<&MailboxClient>,
     _mailbox_id: &str,
     lan: Option<&LanTransport>,
-    peer_port: u16,
+    cfg: &HomeConfig,
     pool: &mut OutboundPool,
 ) -> Result<(), std::io::Error> {
     let (need_frames, our_cursors, bindings, member_hints) = {
@@ -364,8 +372,21 @@ async fn push_now(
         (need_frames, our_cursors, bindings, member_hints)
     };
 
+    // LAN discovery is a separate dial path; do not feed these into dial_addrs.
+    let mut lan_addrs = Vec::new();
     if let Some(lan) = lan {
-        let _ = lan.announce().await;
+        for peer in lan.discover().await {
+            for addr in peer.addrs {
+                if !lan_addrs.contains(&addr) {
+                    lan_addrs.push(addr);
+                }
+            }
+        }
+    }
+    for addr in &cfg.peer_addrs {
+        if !lan_addrs.contains(addr) {
+            lan_addrs.push(*addr);
+        }
     }
 
     if let Some(client) = mailbox {
@@ -418,10 +439,35 @@ async fn push_now(
         }
     }
 
-    let addrs = tailscale_peer_addrs(&member_hints, peer_port);
+    let ts_status = tailscale_status().ok();
+    let mut addrs = match &ts_status {
+        Some(status) => dial_addrs(status, &member_hints, cfg.peer_port),
+        None => Vec::new(),
+    };
+    for addr in &lan_addrs {
+        if !addrs.contains(addr) {
+            addrs.push(*addr);
+        }
+    }
     pool.sessions.retain(|addr, _| addrs.contains(addr));
     for addr in addrs {
-        let _ = sync_peer(pool, addr, signer, store, &our_cursors, &need_frames).await;
+        let path_is_relayed = match &ts_status {
+            Some(status) if !lan_addrs.contains(&addr) => is_relayed_tailscale_path(status, addr),
+            _ => false,
+        };
+        let _ = sync_peer(
+            pool,
+            addr,
+            signer,
+            store,
+            &our_cursors,
+            &need_frames,
+            FileOpPolicy {
+                mode: cfg.sync_mode,
+                path_is_relayed,
+            },
+        )
+        .await;
     }
     Ok(())
 }
@@ -529,6 +575,7 @@ async fn sync_peer(
     store: &Arc<Mutex<SqliteStore>>,
     our_cursors: &[OriginCursor],
     need_frames: &[SignedOperation],
+    policy: FileOpPolicy,
 ) -> Result<(), std::io::Error> {
     if !pool.sessions.contains_key(&addr) {
         let tls = open_outbound_session(addr, signer, store).await?;
@@ -539,7 +586,7 @@ async fn sync_peer(
         let Some(reused) = pool.sessions.get_mut(&addr) else {
             return Err(std::io::Error::other("missing pooled session"));
         };
-        if exchange_have(reused, signer, store, our_cursors, need_frames)
+        if exchange_have(reused, signer, store, our_cursors, need_frames, policy)
             .await
             .is_ok()
         {
@@ -549,7 +596,7 @@ async fn sync_peer(
     pool.sessions.remove(&addr);
     let mut tls = open_outbound_session(addr, signer, store).await?;
     note_connect(pool);
-    exchange_have(&mut tls, signer, store, our_cursors, need_frames).await?;
+    exchange_have(&mut tls, signer, store, our_cursors, need_frames, policy).await?;
     pool.sessions.insert(addr, tls);
     Ok(())
 }
@@ -607,6 +654,7 @@ async fn exchange_have(
     store: &Arc<Mutex<SqliteStore>>,
     our_cursors: &[OriginCursor],
     need_frames: &[SignedOperation],
+    policy: FileOpPolicy,
 ) -> Result<(), std::io::Error> {
     write_peer_frame(
         tls,
@@ -643,6 +691,15 @@ async fn exchange_have(
     };
     for json in missing {
         if let Ok(op) = serde_json::from_str::<SignedOperation>(&json) {
+            let skip = {
+                let store = store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                withhold_file_payload(&store, &op.body, policy)
+            };
+            if skip {
+                continue;
+            }
             write_peer_frame(
                 tls,
                 &PeerFrame::Message(PeerMessage::Op { op: Box::new(op) }),
@@ -651,6 +708,15 @@ async fn exchange_have(
         }
     }
     for frame in need_frames {
+        let skip = {
+            let store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            withhold_file_payload(&store, &frame.body, policy)
+        };
+        if skip {
+            continue;
+        }
         write_peer_frame(
             tls,
             &PeerFrame::Message(PeerMessage::Op {
@@ -691,11 +757,20 @@ fn validated_member_hints(store: &SqliteStore) -> Vec<TransportHint> {
         .collect()
 }
 
-fn tailscale_peer_addrs(member_hints: &[TransportHint], peer_port: u16) -> Vec<SocketAddr> {
-    let Ok(status) = tailscale_status() else {
-        return Vec::new();
+fn withhold_file_payload(store: &SqliteStore, body: &OpBody, policy: FileOpPolicy) -> bool {
+    if should_send_file_op(policy.mode, policy.path_is_relayed) {
+        return false;
+    }
+    if is_file_transfer_op(body) {
+        return true;
+    }
+    let OpBody::Put { envelope } = body else {
+        return false;
     };
-    dial_addrs(&status, member_hints, peer_port)
+    store
+        .open_envelope(envelope)
+        .map(|opened| opened.content_kind == ContentKind::File)
+        .unwrap_or(false)
 }
 
 fn sign_frame(frame: &mut ReplicaFrame, signer: &DeviceSigner) {
@@ -1521,21 +1596,106 @@ mod tests {
 
         let mut pool = OutboundPool::default();
         let (id1, cursors) = put_logged(&pair.a, &pair.sa, b"batch-one");
-        sync_peer(&mut pool, addr, &pair.sa, &pair.a, &cursors, &[])
-            .await
-            .unwrap();
+        sync_peer(
+            &mut pool,
+            addr,
+            &pair.sa,
+            &pair.a,
+            &cursors,
+            &[],
+            FileOpPolicy {
+                mode: SyncMode::Always,
+                path_is_relayed: false,
+            },
+        )
+        .await
+        .unwrap();
         wait_bytes(&pair.b, id1, b"batch-one").await;
         assert_eq!(connects.load(Ordering::SeqCst), 1);
         assert_eq!(pool.connect_count, 1);
 
         let (id2, cursors) = put_logged(&pair.a, &pair.sa, b"batch-two");
-        sync_peer(&mut pool, addr, &pair.sa, &pair.a, &cursors, &[])
-            .await
-            .unwrap();
+        sync_peer(
+            &mut pool,
+            addr,
+            &pair.sa,
+            &pair.a,
+            &cursors,
+            &[],
+            FileOpPolicy {
+                mode: SyncMode::Always,
+                path_is_relayed: false,
+            },
+        )
+        .await
+        .unwrap();
         wait_bytes(&pair.b, id2, b"batch-two").await;
         assert_eq!(connects.load(Ordering::SeqCst), 1);
         assert_eq!(pool.connect_count, 1);
         assert_eq!(pool.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn relayed_path_skips_file_put_keeps_text() {
+        let pair = two_member_stores();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store_in = Arc::clone(&pair.b);
+        let signer_in = pair.sb.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let store = Arc::clone(&store_in);
+                let signer = signer_in.clone();
+                tokio::spawn(async move {
+                    serve_peer_connection(stream, store, signer).await;
+                });
+            }
+        });
+
+        let file_id = {
+            let mut store = pair
+                .a
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (id, _) = store
+                .put_file(
+                    "photo.bin".into(),
+                    "application/octet-stream".into(),
+                    vec![0xAB; 64],
+                )
+                .unwrap();
+            id
+        };
+        let (text_id, cursors) = put_logged(&pair.a, &pair.sa, b"hello-note");
+        let mut pool = OutboundPool::default();
+        sync_peer(
+            &mut pool,
+            addr,
+            &pair.sa,
+            &pair.a,
+            &cursors,
+            &[],
+            FileOpPolicy {
+                mode: SyncMode::Auto,
+                path_is_relayed: true,
+            },
+        )
+        .await
+        .unwrap();
+        wait_bytes(&pair.b, text_id, b"hello-note").await;
+        let listed = {
+            let store = pair
+                .b
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.ls().unwrap()
+        };
+        let ids: Vec<_> = listed.into_iter().map(|item| item.id).collect();
+        assert!(ids.contains(&text_id));
+        assert!(!ids.contains(&file_id));
     }
 
     #[tokio::test]
@@ -1569,16 +1729,38 @@ mod tests {
 
         let mut pool = OutboundPool::default();
         let (id1, cursors) = put_logged(&pair.a, &pair.sa, b"first");
-        sync_peer(&mut pool, addr, &pair.sa, &pair.a, &cursors, &[])
-            .await
-            .unwrap();
+        sync_peer(
+            &mut pool,
+            addr,
+            &pair.sa,
+            &pair.a,
+            &cursors,
+            &[],
+            FileOpPolicy {
+                mode: SyncMode::Always,
+                path_is_relayed: false,
+            },
+        )
+        .await
+        .unwrap();
         wait_bytes(&pair.b, id1, b"first").await;
         assert_eq!(pool.connect_count, 1);
 
         let (id2, cursors) = put_logged(&pair.a, &pair.sa, b"second");
-        sync_peer(&mut pool, addr, &pair.sa, &pair.a, &cursors, &[])
-            .await
-            .unwrap();
+        sync_peer(
+            &mut pool,
+            addr,
+            &pair.sa,
+            &pair.a,
+            &cursors,
+            &[],
+            FileOpPolicy {
+                mode: SyncMode::Always,
+                path_is_relayed: false,
+            },
+        )
+        .await
+        .unwrap();
         wait_bytes(&pair.b, id2, b"second").await;
         assert_eq!(connects.load(Ordering::SeqCst), 2);
         assert_eq!(pool.connect_count, 2);

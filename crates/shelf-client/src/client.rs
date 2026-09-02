@@ -2,12 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
-use shelf_core::{ContentKind, ObjectId};
+use shelf_core::{ContentKind, EpochId, ObjectId};
 #[cfg(any(unix, windows))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ClientError;
-use crate::ipc::{GetTarget, IpcRequest, IpcResponse, ListedItem, ObjectPayload, PutResult};
+use crate::ipc::{
+    GetTarget, IpcRequest, IpcResponse, ListedDevice, ListedItem, ObjectPayload, PutResult,
+};
 
 /// Local IPC client. Each RPC opens a new connection (one request / one
 /// response per socket).
@@ -73,11 +75,66 @@ impl Client {
     }
 
     /// List metadata for stored objects, newest first. No plaintext.
+    /// Archived objects are omitted.
     pub async fn ls(&self) -> Result<Vec<ListedItem>, ClientError> {
-        match rpc(&self.path, &IpcRequest::Ls).await? {
+        self.ls_inner(false).await
+    }
+
+    /// List metadata, optionally including archived objects.
+    pub async fn ls_with_archived(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<ListedItem>, ClientError> {
+        self.ls_inner(include_archived).await
+    }
+
+    async fn ls_inner(&self, include_archived: bool) -> Result<Vec<ListedItem>, ClientError> {
+        match rpc(&self.path, &IpcRequest::Ls { include_archived }).await? {
             IpcResponse::Ls { items } => Ok(items),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
             _ => Err(unexpected("ls")),
+        }
+    }
+
+    /// Decrypt live non-archived objects and return metadata for substring hits.
+    pub async fn search(&self, query: &str) -> Result<Vec<ListedItem>, ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::Search {
+                query: query.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::Search { items } => Ok(items),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("search")),
+        }
+    }
+
+    /// Archive an object by id or 1-based newest-first index.
+    pub async fn archive(&self, target: GetTarget) -> Result<ObjectId, ClientError> {
+        match rpc(&self.path, &IpcRequest::Archive { target }).await? {
+            IpcResponse::Archive { id } => Ok(id),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("archive")),
+        }
+    }
+
+    /// Attach a label to an object by id or 1-based newest-first index.
+    pub async fn label(&self, target: GetTarget, name: &str) -> Result<ObjectId, ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::Label {
+                target,
+                name: name.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::Label { id } => Ok(id),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("label")),
         }
     }
 
@@ -235,6 +292,31 @@ impl Client {
             IpcResponse::RecoveryApply => Ok(()),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
             _ => Err(unexpected("recovery apply")),
+        }
+    }
+
+    /// List vault members (device id, optional name, root flag).
+    pub async fn devices_list(&self) -> Result<Vec<ListedDevice>, ClientError> {
+        match rpc(&self.path, &IpcRequest::DevicesList).await? {
+            IpcResponse::DevicesList { devices } => Ok(devices),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("devices list")),
+        }
+    }
+
+    /// Revoke a member by hex device id. Vault root only.
+    pub async fn devices_revoke(&self, device_id: &str) -> Result<EpochId, ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::DevicesRevoke {
+                device_id: device_id.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::DevicesRevoke { new_epoch } => Ok(new_epoch),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("devices revoke")),
         }
     }
 }

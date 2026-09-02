@@ -21,7 +21,7 @@ fn help_lists_core_commands() {
     );
     for cmd in [
         "put", "latest", "ls", "get", "pin", "rm", "init", "enroll", "scratch", "capture",
-        "recovery",
+        "recovery", "devices", "search",
     ] {
         assert!(
             text.contains(cmd),
@@ -193,6 +193,91 @@ mod ipc {
         let ls_text = String::from_utf8_lossy(&ls.stdout);
         assert!(ls_text.contains("pinned"), "ls after pin:\n{ls_text}");
         assert!(!ls_text.contains("hello"));
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_hits_unique_payload_and_misses_absent() {
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        let payload = format!("find-cli-{}-{}", std::process::id(), "payload");
+        assert_success(&run_with_stdin(&sock, &["put"], payload.as_bytes()));
+        let hit = run(&sock, &["search", &payload]);
+        assert_success(&hit);
+        let hit_text = String::from_utf8_lossy(&hit.stdout);
+        assert!(!hit_text.is_empty(), "search should print an ls-style line");
+        assert!(
+            !hit_text.contains(&payload),
+            "search listing must not include plaintext:\n{hit_text}"
+        );
+
+        let miss = run(&sock, &["search", "no-such-substring-zzzz"]);
+        assert_success(&miss);
+        assert!(miss.stdout.is_empty(), "missing query should print no hits");
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archive_hides_from_ls_until_archived_flag() {
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        let put = run_with_stdin(&sock, &["put"], b"archive-me");
+        assert_success(&put);
+        let id = String::from_utf8_lossy(&put.stdout).trim().to_string();
+        assert_success(&run(&sock, &["archive", "1"]));
+
+        let ls = run(&sock, &["ls"]);
+        assert_success(&ls);
+        let ls_text = String::from_utf8_lossy(&ls.stdout);
+        assert!(
+            !ls_text.contains(&id),
+            "archived item leaked into ls:\n{ls_text}"
+        );
+
+        let with = run(&sock, &["ls", "--archived"]);
+        assert_success(&with);
+        let with_text = String::from_utf8_lossy(&with.stdout);
+        assert!(
+            with_text.contains(&id),
+            "ls --archived missing id:\n{with_text}"
+        );
+        assert!(
+            with_text.contains("archived"),
+            "ls --archived should mark the row"
+        );
+        assert!(!with_text.contains("archive-me"));
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn label_round_trips_on_ls_json() {
+        let sock = temp_socket_path();
+        let _ = std::fs::remove_file(&sock);
+        let server = tokio::spawn(serve(sock.clone(), MemoryStore::new()));
+        wait_for_socket(&sock).await;
+
+        assert_success(&run_with_stdin(&sock, &["put"], b"tagged-item"));
+        assert_success(&run(&sock, &["label", "1", "ops"]));
+        let ls = run(&sock, &["ls", "--json"]);
+        assert_success(&ls);
+        let body = String::from_utf8_lossy(&ls.stdout);
+        assert!(body.contains("\"ops\""), "ls --json missing label:\n{body}");
+        assert!(!body.contains("tagged-item"));
 
         server.abort();
         let _ = server.await;
@@ -474,6 +559,210 @@ fn init_export_approve_import_two_homes() {
     assert!(grant.exists());
     assert!(member.path().join("config.toml").exists());
     assert!(member.path().join("state.db").exists());
+}
+
+fn home_cmd(home: &std::path::Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--home").arg(home);
+    cmd.args(args);
+    cmd
+}
+
+fn device_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn devices_list_then_root_revoke_drops_joiner() {
+    let member = tempfile::tempdir().unwrap();
+    let joiner = tempfile::tempdir().unwrap();
+    let join = joiner.path().join("device.shelfjoin");
+    let grant = member.path().join("device.shelfgrant");
+
+    let init_m = home_cmd(
+        member.path(),
+        &["init", "--name", "mac", "--allow-file-key"],
+    )
+    .output()
+    .unwrap();
+    assert!(init_m.status.success(), "{}", stderr_str(&init_m));
+    let root_id = String::from_utf8_lossy(&init_m.stdout).trim().to_string();
+
+    let init_j = home_cmd(
+        joiner.path(),
+        &["init", "--name", "linux", "--allow-file-key"],
+    )
+    .output()
+    .unwrap();
+    assert!(init_j.status.success(), "{}", stderr_str(&init_j));
+    let joiner_id = String::from_utf8_lossy(&init_j.stdout).trim().to_string();
+
+    let export = home_cmd(
+        joiner.path(),
+        &["enroll", "export", "--out", join.to_str().unwrap()],
+    )
+    .output()
+    .unwrap();
+    assert!(export.status.success(), "{}", stderr_str(&export));
+
+    let approve = home_cmd(
+        member.path(),
+        &[
+            "enroll",
+            "approve",
+            "--join",
+            join.to_str().unwrap(),
+            "--out",
+            grant.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(approve.status.success(), "{}", stderr_str(&approve));
+    let grant_sas = stderr_str(&approve)
+        .lines()
+        .find_map(|l| l.strip_prefix("SAS: "))
+        .expect("approve SAS")
+        .to_owned();
+
+    let import = home_cmd(
+        joiner.path(),
+        &[
+            "enroll",
+            "import",
+            "--grant",
+            grant.to_str().unwrap(),
+            "--expect-sas",
+            &grant_sas,
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(import.status.success(), "{}", stderr_str(&import));
+
+    let listed = home_cmd(member.path(), &["devices"]).output().unwrap();
+    assert!(listed.status.success(), "{}", stderr_str(&listed));
+    let lines = device_lines(&listed.stdout);
+    assert_eq!(
+        lines.len(),
+        2,
+        "stdout={:?}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&root_id) && l.contains("(root)")),
+        "root missing:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines.iter().any(|l| l.contains(&joiner_id)),
+        "joiner missing:\n{}",
+        lines.join("\n")
+    );
+
+    let revoke = home_cmd(member.path(), &["devices", "revoke", &joiner_id])
+        .output()
+        .unwrap();
+    assert!(revoke.status.success(), "{}", stderr_str(&revoke));
+
+    let after = home_cmd(member.path(), &["devices"]).output().unwrap();
+    assert!(after.status.success(), "{}", stderr_str(&after));
+    let after_lines = device_lines(&after.stdout);
+    assert_eq!(
+        after_lines.len(),
+        1,
+        "stdout={:?}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+    assert!(after_lines[0].contains(&root_id));
+    assert!(after_lines[0].contains("(root)"));
+    assert!(!after_lines[0].contains(&joiner_id));
+}
+
+#[test]
+fn devices_revoke_from_non_root_fails_typed() {
+    let member = tempfile::tempdir().unwrap();
+    let joiner = tempfile::tempdir().unwrap();
+    let join = joiner.path().join("device.shelfjoin");
+    let grant = member.path().join("device.shelfgrant");
+
+    let init_m = home_cmd(
+        member.path(),
+        &["init", "--name", "mac", "--allow-file-key"],
+    )
+    .output()
+    .unwrap();
+    assert!(init_m.status.success(), "{}", stderr_str(&init_m));
+    let root_id = String::from_utf8_lossy(&init_m.stdout).trim().to_string();
+
+    let init_j = home_cmd(
+        joiner.path(),
+        &["init", "--name", "linux", "--allow-file-key"],
+    )
+    .output()
+    .unwrap();
+    assert!(init_j.status.success(), "{}", stderr_str(&init_j));
+
+    let export = home_cmd(
+        joiner.path(),
+        &["enroll", "export", "--out", join.to_str().unwrap()],
+    )
+    .output()
+    .unwrap();
+    assert!(export.status.success(), "{}", stderr_str(&export));
+
+    let approve = home_cmd(
+        member.path(),
+        &[
+            "enroll",
+            "approve",
+            "--join",
+            join.to_str().unwrap(),
+            "--out",
+            grant.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(approve.status.success(), "{}", stderr_str(&approve));
+    let grant_sas = stderr_str(&approve)
+        .lines()
+        .find_map(|l| l.strip_prefix("SAS: "))
+        .expect("approve SAS")
+        .to_owned();
+
+    let import = home_cmd(
+        joiner.path(),
+        &[
+            "enroll",
+            "import",
+            "--grant",
+            grant.to_str().unwrap(),
+            "--expect-sas",
+            &grant_sas,
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(import.status.success(), "{}", stderr_str(&import));
+
+    let revoke = home_cmd(joiner.path(), &["devices", "revoke", &root_id])
+        .output()
+        .unwrap();
+    assert!(!revoke.status.success());
+    let err = stderr_str(&revoke);
+    assert!(
+        err.contains("only the vault root can revoke a device"),
+        "typed non-root failure, got {err:?}"
+    );
+    assert!(!err.contains("wrap.key"));
+    assert!(!err.contains("SHELF_RECOVERY_PASSPHRASE"));
 }
 
 #[test]
