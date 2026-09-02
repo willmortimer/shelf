@@ -11,14 +11,14 @@ use crate::store::MemoryStore;
 #[cfg(any(unix, windows))]
 use crate::store::{ipc_target, listed};
 #[cfg(any(unix, windows))]
-use shelf_client::{IpcErrorCode, IpcRequest, IpcResponse};
+use shelf_client::{IpcErrorCode, IpcRequest, IpcResponse, ListedDevice};
 #[cfg(any(unix, windows))]
-use shelf_core::ContentKind;
+use shelf_core::{ContentKind, DeviceId};
 use shelf_keystore::DeviceKeystore;
 #[cfg(any(unix, windows))]
 use shelf_keystore::{
     KeystoreError, ShelfGrant, ShelfJoin, approve_join_store, export_join_store,
-    export_recovery_store, import_grant_store,
+    export_recovery_store, import_grant_store, list_devices_store, revoke_device_store,
 };
 #[cfg(any(unix, windows))]
 use shelf_store::StoreError;
@@ -207,6 +207,7 @@ fn mutates_store(req: &IpcRequest) -> bool {
             | IpcRequest::EnrollExport
             | IpcRequest::EnrollApprove { .. }
             | IpcRequest::EnrollImport { .. }
+            | IpcRequest::DevicesRevoke { .. }
     )
 }
 
@@ -294,6 +295,8 @@ fn dispatch(
             code: IpcErrorCode::Protocol,
             message: "recovery apply is CLI-direct against an empty home".into(),
         },
+        IpcRequest::DevicesList => devices_list(store, keys),
+        IpcRequest::DevicesRevoke { device_id } => devices_revoke(store, keys, device_id),
     }
 }
 
@@ -396,6 +399,72 @@ fn recovery_export(
         },
         Err(err) => keystore_error(err),
     }
+}
+
+#[cfg(any(unix, windows))]
+fn devices_list(store: &MemoryStore, keys: Option<&DeviceKeystore>) -> IpcResponse {
+    let Some(keys) = keys else {
+        return devices_needs_keystore();
+    };
+    match list_devices_store(keys, store) {
+        Ok(entries) => IpcResponse::DevicesList {
+            devices: entries
+                .into_iter()
+                .map(|e| ListedDevice {
+                    device_id: e.device_id,
+                    name: e.name,
+                    is_root: e.is_root,
+                })
+                .collect(),
+        },
+        Err(err) => keystore_error(err),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn devices_revoke(
+    store: &mut MemoryStore,
+    keys: Option<&DeviceKeystore>,
+    device_id: String,
+) -> IpcResponse {
+    let Some(keys) = keys else {
+        return devices_needs_keystore();
+    };
+    let device_id = match parse_hex_device_id(&device_id) {
+        Ok(id) => id,
+        Err(message) => {
+            return IpcResponse::Error {
+                code: IpcErrorCode::Decode,
+                message,
+            };
+        }
+    };
+    match revoke_device_store(keys, store, device_id) {
+        Ok(new_epoch) => IpcResponse::DevicesRevoke { new_epoch },
+        Err(err) => keystore_error(err),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn devices_needs_keystore() -> IpcResponse {
+    IpcResponse::Error {
+        code: IpcErrorCode::Protocol,
+        message: "devices requires an open vault".into(),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn parse_hex_device_id(s: &str) -> Result<DeviceId, String> {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("device id must be 64 hex characters".into());
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        let hex = &s[i * 2..i * 2 + 2];
+        bytes[i] = u8::from_str_radix(hex, 16)
+            .map_err(|_| "device id must be 64 hex characters".to_string())?;
+    }
+    Ok(DeviceId::from_bytes(bytes))
 }
 
 #[cfg(any(unix, windows))]

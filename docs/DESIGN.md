@@ -145,6 +145,8 @@ shelf latest
 shelf latest | jq .
 shelf get 4 > file.bin
 shelf ls
+shelf devices
+shelf devices revoke <device-id>
 shelf search kubernetes
 shelf pin 2
 shelf rm 5

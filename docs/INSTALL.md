@@ -51,7 +51,14 @@ shelf enroll import --grant laptop.shelfgrant
 
 When `shelfd` is already up on that `--home`, `shelf enroll` talks to it over local IPC; otherwise the CLI opens the vault directly.
 
-`shelf devices` is not in this tree yet. Until that command exists, file export / approve / import is the enrollment path.
+List members with `shelf devices`. Only the vault root may revoke:
+
+```bash
+shelf devices
+shelf devices revoke <device-id>
+```
+
+`shelf devices --json` prints the same rows as a JSON array. When `shelfd` is up, these commands go through local IPC; otherwise the CLI opens the vault directly.
 
 ### Start the user service
 

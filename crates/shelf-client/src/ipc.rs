@@ -15,7 +15,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use shelf_core::{ContentKind, HybridTimestamp, ObjectId, Timestamp};
+use shelf_core::{ContentKind, DeviceId, EpochId, HybridTimestamp, ObjectId, Timestamp};
 
 use crate::b64;
 
@@ -108,6 +108,13 @@ pub enum IpcRequest {
         /// Recovery-bundle passphrase. Never log this field.
         passphrase: String,
     },
+    /// List current vault members. Does not mutate the store.
+    DevicesList,
+    /// Revoke a member by hex device id. Vault root only; rotates the epoch.
+    DevicesRevoke {
+        /// Hex [`DeviceId`].
+        device_id: String,
+    },
 }
 
 fn default_scratch_name() -> String {
@@ -149,6 +156,11 @@ impl fmt::Debug for IpcRequest {
             Self::EnrollImport { .. } => write!(f, "EnrollImport"),
             Self::RecoveryExport { .. } => write!(f, "RecoveryExport"),
             Self::RecoveryApply { .. } => write!(f, "RecoveryApply"),
+            Self::DevicesList => write!(f, "DevicesList"),
+            Self::DevicesRevoke { device_id } => f
+                .debug_struct("DevicesRevoke")
+                .field("device_id", device_id)
+                .finish(),
         }
     }
 }
@@ -248,6 +260,16 @@ pub enum IpcResponse {
     },
     /// Successful recovery apply (unused: apply is CLI-direct).
     RecoveryApply,
+    /// Successful member list.
+    DevicesList {
+        /// Current members.
+        devices: Vec<ListedDevice>,
+    },
+    /// Successful revoke (new vault epoch).
+    DevicesRevoke {
+        /// Epoch after rotation.
+        new_epoch: EpochId,
+    },
     /// Typed failure.
     Error {
         /// Stable error class.
@@ -294,6 +316,14 @@ impl fmt::Debug for IpcResponse {
             Self::EnrollImport => write!(f, "EnrollImport"),
             Self::RecoveryExport { .. } => write!(f, "RecoveryExport"),
             Self::RecoveryApply => write!(f, "RecoveryApply"),
+            Self::DevicesList { devices } => f
+                .debug_struct("DevicesList")
+                .field("devices", devices)
+                .finish(),
+            Self::DevicesRevoke { new_epoch } => f
+                .debug_struct("DevicesRevoke")
+                .field("new_epoch", new_epoch)
+                .finish(),
             Self::Error { code, message } => f
                 .debug_struct("Error")
                 .field("code", code)
@@ -317,6 +347,18 @@ pub enum IpcErrorCode {
     Io,
     /// Feature not implemented on this OS.
     UnsupportedOs,
+}
+
+/// One vault member returned by `devices` list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedDevice {
+    /// Hex device identifier.
+    pub device_id: DeviceId,
+    /// Display name when present (local init name; certificates do not carry one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Whether this device is the vault root.
+    pub is_root: bool,
 }
 
 /// Metadata row returned by `ls`. Contains no payload bytes.
@@ -397,6 +439,20 @@ mod tests {
             .unwrap(),
             r#"{"op":"recovery_export","passphrase":"secret"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&IpcRequest::DevicesList).unwrap(),
+            r#"{"op":"devices_list"}"#
+        );
+        let revoke = IpcRequest::DevicesRevoke {
+            device_id: "ab".repeat(32),
+        };
+        assert_eq!(
+            serde_json::to_string(&revoke).unwrap(),
+            format!(
+                r#"{{"op":"devices_revoke","device_id":"{}"}}"#,
+                "ab".repeat(32)
+            )
+        );
     }
 
     #[test]
@@ -466,6 +522,24 @@ mod tests {
     }
 
     #[test]
+    fn listed_device_omits_absent_name() {
+        let row = ListedDevice {
+            device_id: DeviceId::from_bytes([0x11; 32]),
+            name: None,
+            is_root: true,
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(!json.contains("name"));
+        assert!(json.contains("is_root"));
+        let named = ListedDevice {
+            device_id: DeviceId::from_bytes([0x22; 32]),
+            name: Some("mac".into()),
+            is_root: false,
+        };
+        assert!(serde_json::to_string(&named).unwrap().contains("mac"));
+    }
+
+    #[test]
     fn request_debug_redacts_payload() {
         let req = IpcRequest::Put {
             bytes: b"secret-payload".to_vec(),
@@ -487,5 +561,14 @@ mod tests {
             passphrase: "bundle-passphrase".into(),
         };
         assert!(!format!("{apply:?}").contains("bundle-passphrase"));
+
+        let list = IpcRequest::DevicesList;
+        assert_eq!(format!("{list:?}"), "DevicesList");
+        let revoke = IpcRequest::DevicesRevoke {
+            device_id: "ab".repeat(32),
+        };
+        let revoke_debug = format!("{revoke:?}");
+        assert!(revoke_debug.contains("DevicesRevoke"));
+        assert!(revoke_debug.contains("device_id"));
     }
 }

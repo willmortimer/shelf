@@ -21,7 +21,7 @@ fn help_lists_core_commands() {
     );
     for cmd in [
         "put", "latest", "ls", "get", "pin", "rm", "init", "enroll", "scratch", "capture",
-        "recovery",
+        "recovery", "devices",
     ] {
         assert!(
             text.contains(cmd),
@@ -474,6 +474,210 @@ fn init_export_approve_import_two_homes() {
     assert!(grant.exists());
     assert!(member.path().join("config.toml").exists());
     assert!(member.path().join("state.db").exists());
+}
+
+fn home_cmd(home: &std::path::Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--home").arg(home);
+    cmd.args(args);
+    cmd
+}
+
+fn device_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn devices_list_then_root_revoke_drops_joiner() {
+    let member = tempfile::tempdir().unwrap();
+    let joiner = tempfile::tempdir().unwrap();
+    let join = joiner.path().join("device.shelfjoin");
+    let grant = member.path().join("device.shelfgrant");
+
+    let init_m = home_cmd(
+        member.path(),
+        &["init", "--name", "mac", "--allow-file-key"],
+    )
+    .output()
+    .unwrap();
+    assert!(init_m.status.success(), "{}", stderr_str(&init_m));
+    let root_id = String::from_utf8_lossy(&init_m.stdout).trim().to_string();
+
+    let init_j = home_cmd(
+        joiner.path(),
+        &["init", "--name", "linux", "--allow-file-key"],
+    )
+    .output()
+    .unwrap();
+    assert!(init_j.status.success(), "{}", stderr_str(&init_j));
+    let joiner_id = String::from_utf8_lossy(&init_j.stdout).trim().to_string();
+
+    let export = home_cmd(
+        joiner.path(),
+        &["enroll", "export", "--out", join.to_str().unwrap()],
+    )
+    .output()
+    .unwrap();
+    assert!(export.status.success(), "{}", stderr_str(&export));
+
+    let approve = home_cmd(
+        member.path(),
+        &[
+            "enroll",
+            "approve",
+            "--join",
+            join.to_str().unwrap(),
+            "--out",
+            grant.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(approve.status.success(), "{}", stderr_str(&approve));
+    let grant_sas = stderr_str(&approve)
+        .lines()
+        .find_map(|l| l.strip_prefix("SAS: "))
+        .expect("approve SAS")
+        .to_owned();
+
+    let import = home_cmd(
+        joiner.path(),
+        &[
+            "enroll",
+            "import",
+            "--grant",
+            grant.to_str().unwrap(),
+            "--expect-sas",
+            &grant_sas,
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(import.status.success(), "{}", stderr_str(&import));
+
+    let listed = home_cmd(member.path(), &["devices"]).output().unwrap();
+    assert!(listed.status.success(), "{}", stderr_str(&listed));
+    let lines = device_lines(&listed.stdout);
+    assert_eq!(
+        lines.len(),
+        2,
+        "stdout={:?}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&root_id) && l.contains("(root)")),
+        "root missing:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines.iter().any(|l| l.contains(&joiner_id)),
+        "joiner missing:\n{}",
+        lines.join("\n")
+    );
+
+    let revoke = home_cmd(member.path(), &["devices", "revoke", &joiner_id])
+        .output()
+        .unwrap();
+    assert!(revoke.status.success(), "{}", stderr_str(&revoke));
+
+    let after = home_cmd(member.path(), &["devices"]).output().unwrap();
+    assert!(after.status.success(), "{}", stderr_str(&after));
+    let after_lines = device_lines(&after.stdout);
+    assert_eq!(
+        after_lines.len(),
+        1,
+        "stdout={:?}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+    assert!(after_lines[0].contains(&root_id));
+    assert!(after_lines[0].contains("(root)"));
+    assert!(!after_lines[0].contains(&joiner_id));
+}
+
+#[test]
+fn devices_revoke_from_non_root_fails_typed() {
+    let member = tempfile::tempdir().unwrap();
+    let joiner = tempfile::tempdir().unwrap();
+    let join = joiner.path().join("device.shelfjoin");
+    let grant = member.path().join("device.shelfgrant");
+
+    let init_m = home_cmd(
+        member.path(),
+        &["init", "--name", "mac", "--allow-file-key"],
+    )
+    .output()
+    .unwrap();
+    assert!(init_m.status.success(), "{}", stderr_str(&init_m));
+    let root_id = String::from_utf8_lossy(&init_m.stdout).trim().to_string();
+
+    let init_j = home_cmd(
+        joiner.path(),
+        &["init", "--name", "linux", "--allow-file-key"],
+    )
+    .output()
+    .unwrap();
+    assert!(init_j.status.success(), "{}", stderr_str(&init_j));
+
+    let export = home_cmd(
+        joiner.path(),
+        &["enroll", "export", "--out", join.to_str().unwrap()],
+    )
+    .output()
+    .unwrap();
+    assert!(export.status.success(), "{}", stderr_str(&export));
+
+    let approve = home_cmd(
+        member.path(),
+        &[
+            "enroll",
+            "approve",
+            "--join",
+            join.to_str().unwrap(),
+            "--out",
+            grant.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(approve.status.success(), "{}", stderr_str(&approve));
+    let grant_sas = stderr_str(&approve)
+        .lines()
+        .find_map(|l| l.strip_prefix("SAS: "))
+        .expect("approve SAS")
+        .to_owned();
+
+    let import = home_cmd(
+        joiner.path(),
+        &[
+            "enroll",
+            "import",
+            "--grant",
+            grant.to_str().unwrap(),
+            "--expect-sas",
+            &grant_sas,
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(import.status.success(), "{}", stderr_str(&import));
+
+    let revoke = home_cmd(joiner.path(), &["devices", "revoke", &root_id])
+        .output()
+        .unwrap();
+    assert!(!revoke.status.success());
+    let err = stderr_str(&revoke);
+    assert!(
+        err.contains("only the vault root can revoke a device"),
+        "typed non-root failure, got {err:?}"
+    );
+    assert!(!err.contains("wrap.key"));
+    assert!(!err.contains("SHELF_RECOVERY_PASSPHRASE"));
 }
 
 #[test]
