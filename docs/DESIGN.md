@@ -185,7 +185,7 @@ App Intent → Fetch Latest Shelf Item
 
 This enables use from the Action Button, Control Center, Siri, Spotlight, Back Tap, and Shortcuts without requiring continuous clipboard monitoring.
 
-There is no always-on `shelfd` on iOS. `crates/shelf-mobile` opens the vault in-process; Swift Share Sheet / App Intent stubs in `apps/shelf-ios/` are the intended call sites.
+There is no always-on `shelfd` on iOS. `crates/shelf-mobile` opens the vault in-process over a thin C ABI (`include/shelf_mobile.h`); Swift Share Sheet / App Intent call sites in `apps/shelf-ios/` invoke those functions.
 
 ## File transfer
 

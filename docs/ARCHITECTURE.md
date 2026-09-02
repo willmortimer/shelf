@@ -64,8 +64,9 @@ Clients include:
 
 Because iOS does not allow a permanent arbitrary user daemon, the same core
 libraries are embedded in-process via `crates/shelf-mobile` (`MobileSession`).
-Share Sheet and App Intent stubs live in `apps/shelf-ios/` (not a Cargo
-member). Replication is opportunistic when the app or extension is running.
+Share Sheet and App Intent Swift call sites live in `apps/shelf-ios/` (not a
+Cargo member) and link `libshelf_mobile.a`. Replication is opportunistic
+(`MobileSession::sync_once`) when the app or extension is running.
 
 ## Crate structure
 
