@@ -2,12 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
-use shelf_core::{ContentKind, ObjectId};
+use shelf_core::{ContentKind, EpochId, ObjectId};
 #[cfg(any(unix, windows))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ClientError;
-use crate::ipc::{GetTarget, IpcRequest, IpcResponse, ListedItem, ObjectPayload, PutResult};
+use crate::ipc::{
+    GetTarget, IpcRequest, IpcResponse, ListedDevice, ListedItem, ObjectPayload, PutResult,
+};
 
 /// Local IPC client. Each RPC opens a new connection (one request / one
 /// response per socket).
@@ -235,6 +237,31 @@ impl Client {
             IpcResponse::RecoveryApply => Ok(()),
             IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
             _ => Err(unexpected("recovery apply")),
+        }
+    }
+
+    /// List vault members (device id, optional name, root flag).
+    pub async fn devices_list(&self) -> Result<Vec<ListedDevice>, ClientError> {
+        match rpc(&self.path, &IpcRequest::DevicesList).await? {
+            IpcResponse::DevicesList { devices } => Ok(devices),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("devices list")),
+        }
+    }
+
+    /// Revoke a member by hex device id. Vault root only.
+    pub async fn devices_revoke(&self, device_id: &str) -> Result<EpochId, ClientError> {
+        match rpc(
+            &self.path,
+            &IpcRequest::DevicesRevoke {
+                device_id: device_id.to_owned(),
+            },
+        )
+        .await?
+        {
+            IpcResponse::DevicesRevoke { new_epoch } => Ok(new_epoch),
+            IpcResponse::Error { code, message } => Err(ClientError::from_ipc(code, message)),
+            _ => Err(unexpected("devices revoke")),
         }
     }
 }

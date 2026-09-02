@@ -10,12 +10,14 @@ use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
 use shelf_client::{
-    Client, ClientError, GetTarget, ListedItem, resolve_shelf_home, resolve_socket_path,
+    Client, ClientError, GetTarget, ListedDevice, ListedItem, resolve_shelf_home,
+    resolve_socket_path,
 };
-use shelf_core::{ContentKind, ObjectId};
+use shelf_core::{ContentKind, DeviceId, ObjectId};
 use shelf_keystore::{
     KeystoreError, RecoveryBundle, ShelfGrant, ShelfJoin, apply_recovery, approve_join,
-    export_join, export_recovery, grant_sas, import_grant, open_or_create_vault,
+    export_join, export_recovery, grant_sas, import_grant, list_devices_store,
+    open_or_create_vault, revoke_device,
 };
 use thiserror::Error;
 
@@ -137,6 +139,15 @@ pub enum Command {
     },
     /// Put the current system clipboard (explicit capture, not surveillance).
     Capture,
+    /// List vault members, or revoke one (vault root only).
+    Devices {
+        /// Emit a JSON array instead of one device per line.
+        #[arg(long)]
+        json: bool,
+        /// Devices action. Omitted means list.
+        #[command(subcommand)]
+        action: Option<DevicesAction>,
+    },
     /// Export or apply a passphrase-wrapped recovery bundle.
     Recovery {
         /// Recovery action.
@@ -171,6 +182,23 @@ pub enum EnrollAction {
         /// Expected two-way SAS (required when stdin is not a TTY).
         #[arg(long)]
         expect_sas: Option<String>,
+    },
+}
+
+/// `shelf devices` actions.
+#[derive(Debug, Subcommand)]
+pub enum DevicesAction {
+    /// List vault members.
+    List {
+        /// Emit a JSON array instead of one device per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a member by hex device id. Only the vault root may revoke.
+    Revoke {
+        /// Hex device identifier.
+        #[arg(value_name = "ID")]
+        device_id: String,
     },
 }
 
@@ -213,6 +241,16 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Rm { target } => cmd_rm(&socket, &target).await,
         Command::Scratch { name, append } => cmd_scratch(&socket, &name, append).await,
         Command::Capture => cmd_capture(&socket).await,
+        Command::Devices { json, action } => {
+            let action = match action {
+                None => DevicesAction::List { json },
+                Some(DevicesAction::List { json: list_json }) => DevicesAction::List {
+                    json: json || list_json,
+                },
+                Some(DevicesAction::Revoke { device_id }) => DevicesAction::Revoke { device_id },
+            };
+            cmd_devices(&home, &socket, action).await
+        }
         Command::Recovery { action } => cmd_recovery(&home, &socket, action).await,
     }
 }
@@ -297,6 +335,68 @@ fn cmd_enroll_direct(home: &Path, action: EnrollAction) -> Result<(), CliError> 
             Ok(())
         }
     }
+}
+
+async fn cmd_devices(home: &Path, socket: &Path, action: DevicesAction) -> Result<(), CliError> {
+    if Client::connect(socket).await.is_ok() {
+        cmd_devices_ipc(socket, action).await
+    } else {
+        cmd_devices_direct(home, action)
+    }
+}
+
+async fn cmd_devices_ipc(socket: &Path, action: DevicesAction) -> Result<(), CliError> {
+    let client = Client::connect(socket).await?;
+    match action {
+        DevicesAction::List { json } => {
+            let devices = client.devices_list().await?;
+            write_devices(&devices, json)
+        }
+        DevicesAction::Revoke { device_id } => {
+            let _ = parse_device_id(&device_id)?;
+            let new_epoch = client.devices_revoke(&device_id).await?;
+            writeln!(io::stdout(), "{}", new_epoch.as_u64())?;
+            Ok(())
+        }
+    }
+}
+
+fn cmd_devices_direct(home: &Path, action: DevicesAction) -> Result<(), CliError> {
+    match action {
+        DevicesAction::List { json } => {
+            let vault = open_or_create_vault(home, None, None, false)?;
+            let entries = list_devices_store(&vault.keys, &vault.store)?;
+            let devices: Vec<ListedDevice> = entries
+                .into_iter()
+                .map(|e| ListedDevice {
+                    device_id: e.device_id,
+                    name: e.name,
+                    is_root: e.is_root,
+                })
+                .collect();
+            write_devices(&devices, json)
+        }
+        DevicesAction::Revoke { device_id } => {
+            let id = parse_device_id(&device_id)?;
+            let mut vault = open_or_create_vault(home, None, None, false)?;
+            let new_epoch = revoke_device(&mut vault, id)?;
+            writeln!(io::stdout(), "{}", new_epoch.as_u64())?;
+            Ok(())
+        }
+    }
+}
+
+fn write_devices(devices: &[ListedDevice], json: bool) -> Result<(), CliError> {
+    if json {
+        writeln!(io::stdout(), "{}", serde_json::to_string(devices)?)?;
+    } else {
+        let mut out = io::stdout().lock();
+        for device in devices {
+            writeln!(out, "{}", format_device_line(device))?;
+        }
+        out.flush()?;
+    }
+    Ok(())
 }
 
 async fn cmd_recovery(home: &Path, socket: &Path, action: RecoveryAction) -> Result<(), CliError> {
@@ -656,20 +756,26 @@ fn parse_target(s: &str) -> Result<GetTarget, CliError> {
 }
 
 fn parse_object_id(s: &str) -> Result<ObjectId, CliError> {
+    Ok(ObjectId::from_bytes(parse_hex32(s, "object id")?))
+}
+
+fn parse_device_id(s: &str) -> Result<DeviceId, CliError> {
+    Ok(DeviceId::from_bytes(parse_hex32(s, "device id")?))
+}
+
+fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32], CliError> {
     let raw = s.as_bytes();
     if raw.len() != 64 {
-        return Err(CliError::Usage(
-            "object id must be 64 hex characters".into(),
-        ));
+        return Err(CliError::Usage(format!("{what} must be 64 hex characters")));
     }
     let mut bytes = [0u8; 32];
     for i in 0..32 {
         let hex = std::str::from_utf8(&raw[i * 2..i * 2 + 2])
-            .map_err(|_| CliError::Usage("object id must be 64 hex characters".into()))?;
+            .map_err(|_| CliError::Usage(format!("{what} must be 64 hex characters")))?;
         bytes[i] = u8::from_str_radix(hex, 16)
-            .map_err(|_| CliError::Usage("object id must be 64 hex characters".into()))?;
+            .map_err(|_| CliError::Usage(format!("{what} must be 64 hex characters")))?;
     }
-    Ok(ObjectId::from_bytes(bytes))
+    Ok(bytes)
 }
 
 /// One scriptable line: `id kind created` (hex id, kebab-case kind, wall millis).
@@ -682,6 +788,19 @@ fn format_ls_line(item: &ListedItem) -> String {
         item.kind.as_wire_str(),
         item.created.wall().as_millis()
     )
+}
+
+/// One scriptable line: hex id, optional name, and `(root)` for the vault root.
+fn format_device_line(device: &ListedDevice) -> String {
+    let mut line = device.device_id.to_string();
+    if let Some(name) = &device.name {
+        line.push(' ');
+        line.push_str(name);
+    }
+    if device.is_root {
+        line.push_str(" (root)");
+    }
+    line
 }
 
 #[cfg(test)]
@@ -757,6 +876,25 @@ mod tests {
         let pinned_line = format_ls_line(&pinned);
         assert!(pinned_line.ends_with(" pinned"));
         assert!(pinned_line.contains(&item.id.to_string()));
+    }
+
+    #[test]
+    fn device_line_marks_root_and_optional_name() {
+        let root = ListedDevice {
+            device_id: DeviceId::from_bytes([0x11; 32]),
+            name: Some("mac".into()),
+            is_root: true,
+        };
+        assert_eq!(
+            format_device_line(&root),
+            format!("{} mac (root)", root.device_id)
+        );
+        let member = ListedDevice {
+            device_id: DeviceId::from_bytes([0x22; 32]),
+            name: None,
+            is_root: false,
+        };
+        assert_eq!(format_device_line(&member), member.device_id.to_string());
     }
 
     #[test]
