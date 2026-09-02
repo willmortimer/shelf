@@ -4484,6 +4484,7 @@ name = "shelf-desktop"
 version = "0.0.0"
 dependencies = [
  "shelf-client",
+ "shelf-core",
  "slint",
  "tokio",
 ]
