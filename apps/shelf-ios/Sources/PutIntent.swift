@@ -1,4 +1,5 @@
 import AppIntents
+import Foundation
 
 /// App Intent / Shortcuts / Action Button: put the current intent string.
 struct PutOnShelfIntent: AppIntent {
@@ -8,8 +9,10 @@ struct PutOnShelfIntent: AppIntent {
     var text: String
 
     func perform() async throws -> some IntentResult {
-        // Call `shelf-mobile` `put_text` with the app container home.
-        let _ = text
+        let home = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("shelf", isDirectory: true)
+        ShelfMobile.putText(text, home: home)
         return .result()
     }
 }

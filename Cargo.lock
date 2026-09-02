@@ -4490,11 +4490,16 @@ dependencies = [
 name = "shelf-mobile"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
  "shelf-core",
  "shelf-keystore",
+ "shelf-mailbox",
+ "shelf-protocol",
  "shelf-store",
+ "shelf-transport",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
