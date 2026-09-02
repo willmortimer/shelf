@@ -56,7 +56,8 @@ pub fn ensure_home_layout(home: &Path) -> Result<(), KeystoreError> {
              # mailbox_url = \"127.0.0.1:8743\"\n\
              # lan_port = 18732\n\
              # lan_address = \"192.0.2.10:18732\"\n\
-             # peer_port = 18733\n",
+             # peer_port = 18733\n\
+             # sync_mode = \"auto\"\n",
         )?;
     }
     Ok(())

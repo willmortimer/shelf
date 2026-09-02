@@ -269,6 +269,16 @@ This prevents ancient offline replicas from resurrecting content that has alread
 
 Shelf can make transport-aware decisions without weakening cryptographic guarantees.
 
+v1 reads `sync_mode` from `~/.shelf/config.toml` (`auto`, `prefer_direct`, `always`, `metered`; default `auto`):
+
+```toml
+# sync_mode = "auto"
+```
+
+`always` sends every Have/Op to every pooled address.
+
+`auto`, `prefer_direct`, and `metered` still send Hello/Have and non-file ops on every path. They skip `Put` of `ContentKind::File`, `Chunk`, and `NeedChunks` on **relayed Tailscale** addresses (`tailscale status --json` `CurAddr` empty). LAN addresses and direct Tailscale addresses still get file/chunk ops. If `tailscale status` is missing, fail open and treat the path as direct.
+
 Suggested modes:
 
 ```text
