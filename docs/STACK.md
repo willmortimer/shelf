@@ -80,7 +80,7 @@ Versions live in the workspace `[workspace.dependencies]` table.
 
 ## Packaging / CI
 
-Dev pin: `mise.toml` (`rust` 1.98.0 with rustfmt, clippy, rust-src). CI: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` on Ubuntu, macOS, and Windows. The `required` job is the merge gate. `main` should require that check before merge.
+Dev pin: `mise.toml` (`rust` 1.98.0 with rustfmt, clippy, rust-src). CI: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` on Ubuntu, macOS, and Windows. The `required` job is the merge gate. `main` should require that check before merge. User-service units (launchd, systemd `--user`, Windows Startup) live under `contrib/`; first-run steps are in [INSTALL.md](INSTALL.md).
 
 ## License
 

@@ -7,6 +7,7 @@ Start here. Product and architecture docs in this directory are the contract.
 | Doc | What it covers |
 |---|---|
 | [README.md](README.md) | Product overview, components, `~/.shelf/` layout, repo shape, design invariants |
+| [INSTALL.md](INSTALL.md) | First-run how-to: `mise` install, `shelf init`, file enroll, user-service units |
 | [STACK.md](STACK.md) | Languages, workspace layout, packaging, intended crate/app roles |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Process model, crate graph, transports, storage, key providers |
 | [DESIGN.md](DESIGN.md) | User primitives, CLI/GUI/iOS surfaces, retention, transfers |
