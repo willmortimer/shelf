@@ -241,6 +241,7 @@ v1 bundle (`shelf/recovery/v1`, file extension `.shelfrecovery`):
 ```text
 RecoveryRoot (vault root identity secrets
               + current epoch key
+              + historical epoch keys
               + membership snapshot
               + sealed object envelopes)
    ↓
@@ -248,6 +249,8 @@ Argon2id (salt in the bundle) → wrap key
    ↓
 XChaCha20-Poly1305, AAD = transcript(shelf/recovery/v1, version, vault_id)
 ```
+
+The bundle carries every local epoch secret (current and historical) so objects sealed before an epoch rotation still decrypt after apply. Bundles that omit the historical-key field remain valid and restore current-epoch material only. Apply re-wraps those keys under the new home wrap key. The outer format stays `shelf/recovery/v1`.
 
 CLI:
 

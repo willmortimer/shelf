@@ -4,6 +4,8 @@
 //! a vault. Apply restores the existing [`VaultRoot`] onto an empty home so the
 //! recovered device can decrypt and issue v1 root-only grants.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use shelf_core::enrollment::{MembershipSnapshot, VaultRoot};
 use shelf_core::{DOMAIN_RECOVERY, DevicePublicIdentity, EpochId, Transcript, VaultId};
@@ -49,6 +51,9 @@ struct RecoveryPlaintext {
     epoch: EpochId,
     vault_id: VaultId,
     epoch_key: [u8; 32],
+    /// Historical (and current) epoch secrets. Absent on pre-keyring bundles.
+    #[serde(default)]
+    epoch_keys: Vec<(u64, [u8; 32])>,
     vault_root: VaultRoot,
     snapshot: MembershipSnapshot,
     objects: Vec<SealedRecord>,
@@ -57,6 +62,10 @@ struct RecoveryPlaintext {
 impl Drop for RecoveryPlaintext {
     fn drop(&mut self) {
         self.epoch_key.zeroize();
+        for (_, key) in &mut self.epoch_keys {
+            key.zeroize();
+        }
+        self.epoch_keys.clear();
     }
 }
 
@@ -90,18 +99,23 @@ pub fn export_recovery_store(
     let objects = store
         .export_objects()
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    let epoch_keys = collect_epoch_keys(keys, store)?;
     let mut plaintext = RecoveryPlaintext {
         identity: keys.public_identity().clone(),
         secrets: keys.secret_blob(),
         epoch: store.epoch(),
         vault_id: store.vault_id(),
         epoch_key: *store.epoch_key().as_bytes(),
+        epoch_keys,
         vault_root: root,
         snapshot,
         objects,
     };
     let json = serde_json::to_vec(&plaintext)?;
     plaintext.epoch_key.zeroize();
+    for (_, key) in &mut plaintext.epoch_keys {
+        key.zeroize();
+    }
     drop(plaintext);
     let salt: [u8; 16] = rand::random();
     let key = argon2_recovery_key(passphrase, &salt, ARGON2_M_KIB, ARGON2_T, ARGON2_P)?;
@@ -167,6 +181,16 @@ pub fn apply_recovery(
     store
         .save_wrapped_epoch_key(&wrapped_epoch)
         .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    for (epoch, key_bytes) in &plaintext.epoch_keys {
+        let epoch = EpochId::new(*epoch);
+        store
+            .add_epoch_key(epoch, EpochKey::from_bytes(*key_bytes))
+            .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+        let wrapped = keys.wrap_secret(key_bytes)?;
+        store
+            .save_epoch_wrap(epoch, &wrapped)
+            .map_err(|e| KeystoreError::Identity(e.to_string()))?;
+    }
     for rec in &plaintext.objects {
         store
             .ingest_envelope(
@@ -217,6 +241,35 @@ fn unwrap_bundle(
     Ok(plaintext)
 }
 
+/// Unwrap every local epoch wrap under the current device wrap key, then
+/// include the in-memory current epoch if it was missing from the table.
+fn collect_epoch_keys(
+    keys: &DeviceKeystore,
+    store: &SqliteStore,
+) -> Result<Vec<(u64, [u8; 32])>, KeystoreError> {
+    let mut seen = HashSet::new();
+    let mut epoch_keys = Vec::new();
+    for (epoch, wrapped) in store
+        .list_epoch_wraps()
+        .map_err(|e| KeystoreError::Identity(e.to_string()))?
+    {
+        let mut raw = keys.unwrap_secret(&wrapped)?;
+        let copied: Result<[u8; 32], _> = raw.as_slice().try_into();
+        raw.zeroize();
+        let bytes =
+            copied.map_err(|_| KeystoreError::Identity("epoch key must be 32 bytes".into()))?;
+        let id = epoch.as_u64();
+        if seen.insert(id) {
+            epoch_keys.push((id, bytes));
+        }
+    }
+    let current = store.epoch().as_u64();
+    if seen.insert(current) {
+        epoch_keys.push((current, *store.epoch_key().as_bytes()));
+    }
+    Ok(epoch_keys)
+}
+
 fn recovery_aad(vault_id: &VaultId) -> Vec<u8> {
     let mut t = Transcript::new(DOMAIN_RECOVERY);
     t.push_u16(RECOVERY_VERSION);
@@ -244,7 +297,8 @@ fn argon2_recovery_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{approve_join, export_join, open_or_create_vault};
+    use crate::{approve_join, export_join, open_or_create_vault, revoke_device};
+    use shelf_store::ItemTarget;
 
     fn unique_passphrase() -> String {
         format!("recovery-{}", hex_8(rand::random::<[u8; 8]>()))
@@ -334,5 +388,78 @@ mod tests {
             Ok(_) => panic!("inflated Argon2 memory must fail"),
         };
         assert!(matches!(err, KeystoreError::Recovery));
+    }
+
+    #[test]
+    fn recovery_decrypts_objects_from_prior_epochs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let mut vault = open_or_create_vault(src.path(), Some("root"), None, true).unwrap();
+        let old_epoch = vault.store.epoch();
+        let payload_a = b"object-a-old-epoch";
+        let (id_a, _) = vault
+            .store
+            .put(payload_a.to_vec(), shelf_core::ContentKind::Text, None)
+            .unwrap();
+        let victim = shelf_core::DeviceId::new();
+        let new_epoch = revoke_device(&mut vault, victim).unwrap();
+        assert!(new_epoch > old_epoch);
+        let payload_b = b"object-b-new-epoch";
+        let (id_b, _) = vault
+            .store
+            .put(payload_b.to_vec(), shelf_core::ContentKind::Text, None)
+            .unwrap();
+        let pass = unique_passphrase();
+        let bundle = export_recovery(&vault, &pass).unwrap();
+        drop(vault);
+
+        let recovered = apply_recovery(dst.path(), &bundle, &pass, None, true).unwrap();
+        let opened_a = recovered.store.get(&ItemTarget::Id(id_a)).unwrap();
+        let opened_b = recovered.store.get(&ItemTarget::Id(id_b)).unwrap();
+        assert_eq!(opened_a.bytes, payload_a);
+        assert_eq!(opened_b.bytes, payload_b);
+        assert_eq!(recovered.store.latest().unwrap().bytes, payload_b);
+        assert!(recovered.store.key_for(old_epoch).is_ok());
+        assert!(recovered.store.key_for(new_epoch).is_ok());
+        drop(recovered);
+
+        let reopened = open_or_create_vault(dst.path(), Some("root"), None, true).unwrap();
+        assert_eq!(
+            reopened.store.get(&ItemTarget::Id(id_a)).unwrap().bytes,
+            payload_a
+        );
+        assert_eq!(
+            reopened.store.get(&ItemTarget::Id(id_b)).unwrap().bytes,
+            payload_b
+        );
+    }
+
+    #[test]
+    fn apply_bundle_missing_epoch_keys_field() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let mut vault = open_or_create_vault(src.path(), Some("root"), None, true).unwrap();
+        let payload = b"current-epoch-only";
+        vault
+            .store
+            .put(payload.to_vec(), shelf_core::ContentKind::Text, None)
+            .unwrap();
+        let pass = unique_passphrase();
+        let mut bundle = export_recovery(&vault, &pass).unwrap();
+        let plaintext = unwrap_bundle(&bundle, &pass).unwrap();
+        let mut value = serde_json::to_value(&plaintext).unwrap();
+        value
+            .as_object_mut()
+            .expect("plaintext object")
+            .remove("epoch_keys");
+        let json = serde_json::to_vec(&value).unwrap();
+        let key =
+            argon2_recovery_key(&pass, &bundle.salt, ARGON2_M_KIB, ARGON2_T, ARGON2_P).unwrap();
+        let aad = recovery_aad(&bundle.vault_id);
+        bundle.wrapped = crate::aead_wrap(&key, &aad, &json).unwrap();
+        drop(vault);
+
+        let recovered = apply_recovery(dst.path(), &bundle, &pass, None, true).unwrap();
+        assert_eq!(recovered.store.latest().unwrap().bytes, payload);
     }
 }
