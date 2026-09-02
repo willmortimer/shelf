@@ -1,0 +1,17 @@
+[Unit]
+Description=Shelf replica daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/shelfd
+Restart=on-failure
+
+# Optional passphrase vault unlock. Do not put the secret in this unit.
+# Place a 0600 file at ~/.config/credstore/shelf.passphrase (or another path
+# after the colon), then uncomment. systemd sets CREDENTIALS_DIRECTORY;
+# shelfd reads the credential named shelf.passphrase (see apps/shelfd/src/passphrase.rs).
+#LoadCredential=shelf.passphrase
+
+[Install]
+WantedBy=default.target
