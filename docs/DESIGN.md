@@ -99,7 +99,7 @@ Cmd/Ctrl + Shift + V
 
 opens a searchable recent-item palette.
 
-`shelf-desktop` is that palette. Bind the OS global shortcut to the `shelf-desktop` binary (the app does not register a hotkey crate; that keeps CI and Wayland simple). Type to filter by kind or id. Click, or press Return on a match, copies the item into the system clipboard and closes the palette. The user then uses the normal paste shortcut.
+`shelf-desktop` is a small Slint app: the Shelf palette plus Capture, Scratch, Transfers, Devices, and Settings tabs over `shelfd` IPC. Bind the OS global shortcut to the `shelf-desktop` binary (the app does not register a hotkey crate; that keeps CI and Wayland simple). On the Shelf tab, type to filter by kind or id. Click, or press Return on a match, copies the item into the system clipboard. The user then uses the normal paste shortcut.
 
 This avoids depending on cross-platform synthetic keystroke injection, especially on Wayland.
 
