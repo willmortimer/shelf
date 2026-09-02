@@ -58,7 +58,7 @@ async fn replica_loop(
         Some(addr) if !addr.is_empty() => MailboxClient::connect(addr).await.ok(),
         _ => None,
     };
-    let lan = LanTransport::bind(cfg.lan_port).await.ok();
+    let lan = LanTransport::bind(cfg.lan_port, cfg.peer_port).await.ok();
     let mailbox_id = {
         let store = store
             .lock()
@@ -364,8 +364,16 @@ async fn push_now(
         (need_frames, our_cursors, bindings, member_hints)
     };
 
+    // LAN discovery is a separate dial path; do not feed these into dial_addrs.
+    let mut lan_addrs = Vec::new();
     if let Some(lan) = lan {
-        let _ = lan.announce().await;
+        for peer in lan.discover().await {
+            for addr in peer.addrs {
+                if !lan_addrs.contains(&addr) {
+                    lan_addrs.push(addr);
+                }
+            }
+        }
     }
 
     if let Some(client) = mailbox {
@@ -418,7 +426,12 @@ async fn push_now(
         }
     }
 
-    let addrs = tailscale_peer_addrs(&member_hints, peer_port);
+    let mut addrs = tailscale_peer_addrs(&member_hints, peer_port);
+    for addr in lan_addrs {
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
     pool.sessions.retain(|addr, _| addrs.contains(addr));
     for addr in addrs {
         let _ = sync_peer(pool, addr, signer, store, &our_cursors, &need_frames).await;
