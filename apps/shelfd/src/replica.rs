@@ -383,6 +383,11 @@ async fn push_now(
             }
         }
     }
+    for addr in &cfg.peer_addrs {
+        if !lan_addrs.contains(addr) {
+            lan_addrs.push(*addr);
+        }
+    }
 
     if let Some(client) = mailbox {
         let ops = {

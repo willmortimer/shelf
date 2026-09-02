@@ -98,6 +98,15 @@ Replica Tailscale dials only the intersection of currently online host-Tailscale
 
 Join export already fills hints from `tailscale status --json` (self MagicDNS and Tailscale IPs) when that command succeeds. Run Tailscale on **both** members before `shelf enroll export` / `approve` so each side’s hints land in the grant snapshot.
 
+Host firewalls and tailnet ACLs must allow TCP `peer_port` (default 18733) on the Tailscale interface. A NixOS `networking.firewall` that only opens SSH will accept `shelf` IPC locally and still drop replica dials. WSL2 NAT plus broken multicast also hides DNS-SD. If a peer is reachable on a LAN or forwarded socket, set a local extra dial (not a membership hint) on the initiator:
+
+```toml
+# ~/.shelf/config.toml
+peer_addrs = "10.10.30.148:18733"
+```
+
+Those addresses join the outbound TLS pool as LAN paths (file ops are not treated as relayed). Restart `shelfd` after editing. One side initiating is enough: the session exchanges Have/ops in both directions.
+
 ## Passphrase-protected vaults
 
 `shelfd` never takes a passphrase on argv. Unlock order (see `apps/shelfd/src/passphrase.rs`):

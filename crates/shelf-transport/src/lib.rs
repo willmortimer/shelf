@@ -70,6 +70,11 @@ pub struct HomeConfig {
     pub lan_port: u16,
     /// TCP port for framed Tailscale/LAN peer sessions.
     pub peer_port: u16,
+    /// Extra `host:port` replica dials (comma-separated). Treated as LAN paths.
+    ///
+    /// Use when DNS-SD cannot see a peer (WSL NAT) or Tailscale ACLs block
+    /// `peer_port`, but a LAN or forwarded socket still answers `shelf/2`.
+    pub peer_addrs: Vec<SocketAddr>,
     /// File/chunk fan-out policy. Defaults to [`SyncMode::Auto`].
     pub sync_mode: SyncMode,
 }
@@ -81,6 +86,7 @@ pub fn parse_home_config(path: &Path) -> HomeConfig {
         mailbox_url: None,
         lan_port: 18732,
         peer_port: 18733,
+        peer_addrs: Vec::new(),
         sync_mode: SyncMode::Auto,
     };
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -112,11 +118,24 @@ pub fn parse_home_config(path: &Path) -> HomeConfig {
                     cfg.peer_port = p;
                 }
             }
+            "peer_addrs" => cfg.peer_addrs = parse_peer_addrs(val),
             "sync_mode" => cfg.sync_mode = parse_sync_mode(val),
             _ => {}
         }
     }
     cfg
+}
+
+fn parse_peer_addrs(val: &str) -> Vec<SocketAddr> {
+    val.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            part.parse().ok()
+        })
+        .collect()
 }
 
 fn parse_sync_mode(val: &str) -> SyncMode {
@@ -433,6 +452,28 @@ mod tests {
         assert_eq!(cfg.lan_port, 19000);
         assert_eq!(cfg.peer_port, 19100);
         assert_eq!(cfg.sync_mode, SyncMode::Auto);
+        assert!(cfg.peer_addrs.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_peer_addrs_comma_separated() {
+        let dir = std::env::temp_dir().join(format!("shelf-cfg-peers-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "peer_addrs = \"10.10.30.148:18733, 192.0.2.10:19100\"\n",
+        )
+        .unwrap();
+        let cfg = parse_home_config(&path);
+        assert_eq!(
+            cfg.peer_addrs,
+            vec![
+                "10.10.30.148:18733".parse().unwrap(),
+                "192.0.2.10:19100".parse().unwrap(),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
