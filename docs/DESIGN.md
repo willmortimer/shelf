@@ -148,6 +148,8 @@ shelf ls
 shelf devices
 shelf devices revoke <device-id>
 shelf search kubernetes
+shelf archive 3
+shelf label 2 ops
 shelf pin 2
 shelf rm 5
 shelf scratch

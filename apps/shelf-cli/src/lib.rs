@@ -109,6 +109,30 @@ pub enum Command {
         /// Emit a JSON array instead of the default `id kind created` lines.
         #[arg(long)]
         json: bool,
+        /// Include archived objects (hidden by default).
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Search decrypted non-archived objects (local substring, not indexed).
+    Search {
+        /// Case-insensitive needle over plaintext and optional name.
+        #[arg(value_name = "QUERY")]
+        query: String,
+    },
+    /// Archive an object (hidden from default `ls`).
+    Archive {
+        /// 1-based newest-first index, or 64-character hex id.
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
+    /// Attach a label to an object.
+    Label {
+        /// 1-based newest-first index, or 64-character hex id.
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Label text.
+        #[arg(value_name = "NAME")]
+        name: String,
     },
     /// Write one object's plaintext to stdout (no extra newline).
     Get {
@@ -235,10 +259,13 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Enroll { action } => cmd_enroll(&home, &socket, action).await,
         Command::Put { name, kind, file } => cmd_put(&socket, name, kind, file).await,
         Command::Latest => cmd_latest(&socket).await,
-        Command::Ls { json } => cmd_ls(&socket, json).await,
+        Command::Ls { json, archived } => cmd_ls(&socket, json, archived).await,
+        Command::Search { query } => cmd_search(&socket, &query).await,
         Command::Get { target } => cmd_get(&socket, &target).await,
         Command::Pin { target } => cmd_pin(&socket, &target).await,
         Command::Rm { target } => cmd_rm(&socket, &target).await,
+        Command::Archive { target } => cmd_archive(&socket, &target).await,
+        Command::Label { target, name } => cmd_label(&socket, &target, &name).await,
         Command::Scratch { name, append } => cmd_scratch(&socket, &name, append).await,
         Command::Capture => cmd_capture(&socket).await,
         Command::Devices { json, action } => {
@@ -560,14 +587,24 @@ async fn cmd_latest(socket: &Path) -> Result<(), CliError> {
     write_stdout(&obj.bytes)
 }
 
-async fn cmd_ls(socket: &Path, json: bool) -> Result<(), CliError> {
+async fn cmd_ls(socket: &Path, json: bool, archived: bool) -> Result<(), CliError> {
     let client = Client::connect(socket).await?;
-    let items = client.ls().await?;
+    let items = client.ls_with_archived(archived).await?;
+    write_listed(&items, json)
+}
+
+async fn cmd_search(socket: &Path, query: &str) -> Result<(), CliError> {
+    let client = Client::connect(socket).await?;
+    let items = client.search(query).await?;
+    write_listed(&items, false)
+}
+
+fn write_listed(items: &[ListedItem], json: bool) -> Result<(), CliError> {
     if json {
-        writeln!(io::stdout(), "{}", serde_json::to_string(&items)?)?;
+        writeln!(io::stdout(), "{}", serde_json::to_string(items)?)?;
     } else {
         let mut out = io::stdout().lock();
-        for item in &items {
+        for item in items {
             writeln!(out, "{}", format_ls_line(item))?;
         }
         out.flush()?;
@@ -590,6 +627,21 @@ async fn cmd_pin(socket: &Path, target: &str) -> Result<(), CliError> {
 async fn cmd_rm(socket: &Path, target: &str) -> Result<(), CliError> {
     let client = Client::connect(socket).await?;
     let _id = client.rm(parse_target(target)?).await?;
+    Ok(())
+}
+
+async fn cmd_archive(socket: &Path, target: &str) -> Result<(), CliError> {
+    let client = Client::connect(socket).await?;
+    let _id = client.archive(parse_target(target)?).await?;
+    Ok(())
+}
+
+async fn cmd_label(socket: &Path, target: &str, name: &str) -> Result<(), CliError> {
+    if name.is_empty() {
+        return Err(CliError::Usage("label name must not be empty".into()));
+    }
+    let client = Client::connect(socket).await?;
+    let _id = client.label(parse_target(target)?, name).await?;
     Ok(())
 }
 
@@ -779,11 +831,12 @@ fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32], CliError> {
 }
 
 /// One scriptable line: `id kind created` (hex id, kebab-case kind, wall millis).
-/// Pinned items append ` pinned`.
+/// Pinned items append ` pinned`. Archived items append ` archived`.
 fn format_ls_line(item: &ListedItem) -> String {
     let pin = if item.pinned { " pinned" } else { "" };
+    let archived = if item.archived { " archived" } else { "" };
     format!(
-        "{} {} {}{pin}",
+        "{} {} {}{pin}{archived}",
         item.id,
         item.kind.as_wire_str(),
         item.created.wall().as_millis()
@@ -865,6 +918,8 @@ mod tests {
             created: HybridTimestamp::new(0, Timestamp::from_millis(42)),
             pinned: false,
             expires_at: None,
+            archived: false,
+            labels: Vec::new(),
         };
         let line = format_ls_line(&item);
         assert_eq!(line, format!("{} text 42", item.id));
@@ -876,6 +931,10 @@ mod tests {
         let pinned_line = format_ls_line(&pinned);
         assert!(pinned_line.ends_with(" pinned"));
         assert!(pinned_line.contains(&item.id.to_string()));
+
+        let mut archived = item.clone();
+        archived.archived = true;
+        assert!(format_ls_line(&archived).ends_with(" archived"));
     }
 
     #[test]

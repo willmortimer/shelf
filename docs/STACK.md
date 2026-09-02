@@ -70,7 +70,7 @@ Peer TLS ALPN `shelf/2` is length-prefixed binary (`SHLF` + version + big-endian
 Listed for later implementation; not added to manifests in the bootstrap pass.
 
 - CRDT text: Yrs (`yrs`) for scratchpads (design pack suggested Automerge; implementation uses Yrs). After the first write, persist seals a Yrs update encoded from the last-applied state vector rather than a full empty-SV document.
-- Local store: SQLite via `rusqlite` (bundled)
+- Local store: SQLite via `rusqlite` (bundled). Object listing metadata includes pin, archive, and labels (no plaintext); `ls` omits archived rows unless `shelf ls --archived`. `shelf search` decrypts live non-archived objects in memory and matches a case-insensitive substring on UTF-8 plaintext and optional name (no searchable encryption).
 - Crypto providers: X25519, ML-KEM-768, XChaCha20-Poly1305, Argon2id, keyed BLAKE3
 - Desktop: Slint
 - CLI: clap
