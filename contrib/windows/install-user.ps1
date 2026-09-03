@@ -52,5 +52,22 @@ try {
     Write-Host "Startup shortcut COM failed; wrote $cmdPath instead."
 }
 
+# Persist inbound replica TLS. Failures are non-fatal (may need elevation).
+try {
+    if (-not (Get-NetFirewallRule -DisplayName 'Shelf replica peer_port' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName 'Shelf replica peer_port' -Direction Inbound -Protocol TCP -LocalPort 18733 -Action Allow | Out-Null
+        Write-Host 'Firewall: inbound TCP 18733 allowed'
+    }
+} catch {
+    Write-Host "Firewall: could not add TCP 18733 ($($_.Exception.Message))"
+}
+
+cmd /c "schtasks /Create /F /TN ShelfShelfd /SC ONLOGON /TR `"$shelfd`""
+if ($LASTEXITCODE -eq 0) {
+    Write-Host 'Scheduled task: ShelfShelfd (ONLOGON)'
+} else {
+    Write-Host "Scheduled task: skipped (exit $LASTEXITCODE)"
+}
+
 Write-Host "Installed. Log off/on (or start $shelfd) so the user service is running."
 Write-Host "Optional GUI: cargo install --path apps/shelf-desktop --force  (or: mise run install)"

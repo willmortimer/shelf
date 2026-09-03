@@ -107,6 +107,8 @@ peer_addrs = "10.10.30.148:18733"
 
 Those addresses join the outbound TLS pool as LAN paths (file ops are not treated as relayed). Restart `shelfd` after editing. One side initiating is enough: the session exchanges Have/ops in both directions.
 
+On Windows, `install-user.ps1` also tries to allow inbound TCP 18733 and create an ONLOGON scheduled task (`ShelfShelfd`) so the daemon is not killed with a Tailscale SSH session. Tailscale grants for `18733` live in the tailnet policy (`tag:personal` / `tag:nixplane-workstation` only).
+
 ## Passphrase-protected vaults
 
 `shelfd` never takes a passphrase on argv. Unlock order (see `apps/shelfd/src/passphrase.rs`):
