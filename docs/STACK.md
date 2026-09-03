@@ -55,7 +55,7 @@ Invariant: `shelf-core` must not depend on `shelf-mailbox`.
 
 ## Runtime / state
 
-- Local IPC: Unix domain sockets (macOS/Linux); named pipes or local IPC (Windows).
+- Local IPC: Unix domain sockets (macOS/Linux); Windows named pipes `\\.\pipe\shelf-<hash>` (client retries `ERROR_PIPE_BUSY`; server keeps up to 8 instances).
 - Userland state root: `~/.shelf/` (`config.toml`, `state.db`, objects, chunks, logs, runtime, cache, export, enrollment).
 - `shelf init` / `shelf enroll` write identity + vault under `--home`. Wrap-key custody is platform store or `--passphrase`; `--allow-file-key` is required for 0600 `wrap.key`. iOS never uses file wrap. When `shelfd` is up, `shelf enroll` uses local IPC against the daemon's open vault; when the daemon is down, the CLI opens the vault directly.
 - `shelf recovery export --out` writes a passphrase-wrapped `.shelfrecovery` (`shelf/recovery/v1`: Argon2id + XChaCha20-Poly1305). Passphrase is a hidden TTY or `SHELF_RECOVERY_PASSPHRASE` (not argv). Export uses IPC when `shelfd` is up. `shelf recovery apply --from` is always CLI-direct against an empty `--home` and restores the existing `VaultRoot`. A mailbox cannot recover a vault.

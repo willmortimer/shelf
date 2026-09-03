@@ -1,6 +1,10 @@
 //! Unix-domain client for `shelfd`.
 
+#[cfg(windows)]
+use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use shelf_core::{ContentKind, EpochId, ObjectId};
 #[cfg(any(unix, windows))]
@@ -22,8 +26,9 @@ impl Client {
     /// Connect to a running daemon at `path`.
     ///
     /// The socket is opened to verify the daemon is reachable, then dropped.
-    /// Subsequent calls reconnect. On platforms other than Unix and Windows
-    /// this returns [`ClientError::UnsupportedOs`].
+    /// Subsequent calls reconnect. Windows retries `ERROR_PIPE_BUSY` because
+    /// the probe and the RPC each consume a waiting pipe instance. On platforms
+    /// other than Unix and Windows this returns [`ClientError::UnsupportedOs`].
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let path = path.as_ref().to_path_buf();
         probe(&path).await?;
@@ -419,5 +424,32 @@ fn open_windows_pipe(
     path: &Path,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, ClientError> {
     use tokio::net::windows::named_pipe::ClientOptions;
-    Ok(ClientOptions::new().open(path)?)
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    loop {
+        match ClientOptions::new().open(path) {
+            Ok(stream) => return Ok(stream),
+            Err(err) if is_pipe_busy(&err) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_pipe_busy(err: &io::Error) -> bool {
+    // ERROR_PIPE_BUSY
+    err.raw_os_error() == Some(231)
+}
+
+#[cfg(all(test, windows))]
+mod windows_pipe_tests {
+    use super::is_pipe_busy;
+    use std::io;
+
+    #[test]
+    fn recognizes_error_pipe_busy() {
+        assert!(is_pipe_busy(&io::Error::from_raw_os_error(231)));
+        assert!(!is_pipe_busy(&io::Error::from_raw_os_error(2)));
+    }
 }

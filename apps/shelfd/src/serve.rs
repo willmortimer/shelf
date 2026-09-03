@@ -559,11 +559,13 @@ async fn serve_windows(
 
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
+        // Probe + RPC each consume a waiting instance; keep a small pool.
+        .max_instances(8)
         .create(pipe_path)?;
     loop {
         server.connect().await?;
         let connected = server;
-        server = ServerOptions::new().create(pipe_path)?;
+        server = ServerOptions::new().max_instances(8).create(pipe_path)?;
         let store = Arc::clone(&store);
         let notify = Arc::clone(&notify);
         let keys = keys.clone();
